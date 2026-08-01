@@ -1,0 +1,712 @@
+"""Interfaz textual: lista densa arriba, todo lo demás en modales.
+
+Dos reglas mandan sobre el diseño:
+
+* **Cabe en un pane chico.** 80x15 es el caso de referencia; nada usa alto fijo y los
+  anchos se recalculan en cada `Resize`, truncando con puntos suspensivos.
+* **Se opera con mouse.** Cada acción tiene un blanco clickeable: filas, botones de la
+  cabecera, teclas del footer y botones dentro de los modales. El teclado es atajo.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta
+
+from rich.text import Text
+from textual import events, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.coordinate import Coordinate
+from textual.message import Message
+from textual.screen import ModalScreen, Screen
+from textual.theme import Theme
+from textual.widgets import Button, DataTable, Footer, Input, Markdown, OptionList, Static
+from textual.widgets.option_list import Option
+
+from .datos import (
+    ANCHO_VENCE,
+    Backend,
+    ErrorGh,
+    Tarea,
+    acortar,
+    etiqueta_vencimiento,
+    fecha_larga,
+    mas_un_mes,
+)
+
+REFRESCO_SEGUNDOS = 300.0
+ANCHO_CLIENTE_MAX = 22
+ANCHO_CLIENTE_MIN = 10
+
+# ------------------------------------------------------------------------------------
+# Theme: hereda la paleta ANSI del terminal en vez de fijar colores propios.
+# `ansi=True` deja pasar los colores 0-15 tal cual, y foreground/background en
+# "ansi_default" usan los del terminal, así que si el terminal conmuta claro/oscuro
+# la TUI conmuta con él sin enterarse. `surface`/`panel` van a "ansi_black" (color 0),
+# que en cualquier esquema decente es un gris de panel y no el fondo: así los modales
+# contrastan tanto en claro como en oscuro.
+# ------------------------------------------------------------------------------------
+THEME_TERMINAL = Theme(
+    name="terminal",
+    ansi=True,
+    primary="ansi_yellow",
+    secondary="ansi_cyan",
+    accent="ansi_yellow",
+    warning="ansi_yellow",
+    error="ansi_red",
+    success="ansi_green",
+    foreground="ansi_default",
+    background="ansi_default",
+    surface="ansi_black",
+    panel="ansi_black",
+    boost="ansi_black",
+    dark=True,
+    variables={
+        # Textual exige estas dos cuando ansi=True; en "default" quedan transparentes,
+        # que es justo lo que queremos para no pelear con el fondo del terminal.
+        "ansi-background": "ansi_default",
+        "ansi-foreground": "ansi_default",
+        "border-blurred": "ansi_bright_black",
+        "block-cursor-foreground": "ansi_black",
+        "block-cursor-background": "ansi_yellow",
+        "block-cursor-text-style": "bold",
+        "block-cursor-blurred-foreground": "ansi_default",
+        "block-cursor-blurred-background": "ansi_bright_black",
+        "block-cursor-blurred-text-style": "none",
+        "footer-background": "ansi_default",
+        "footer-key-background": "ansi_default",
+        "footer-description-background": "ansi_default",
+        "footer-key-foreground": "ansi_yellow",
+        "footer-description-foreground": "ansi_default",
+        "input-cursor-background": "ansi_yellow",
+        "input-cursor-foreground": "ansi_black",
+        "input-selection-background": "ansi_bright_black",
+        "input-selection-foreground": "ansi_default",
+        "input-cursor-text-style": "none",
+        "button-foreground": "ansi_default",
+        "screen-selection-background": "ansi_bright_black",
+        "screen-selection-foreground": "ansi_default",
+        "scrollbar": "ansi_bright_black",
+        "scrollbar-hover": "ansi_yellow",
+        "scrollbar-active": "ansi_yellow",
+        "scrollbar-background": "ansi_default",
+        "scrollbar-background-hover": "ansi_default",
+        "scrollbar-background-active": "ansi_default",
+        "scrollbar-corner-color": "ansi_default",
+    },
+)
+
+
+# ------------------------------------------------------------------------------------
+# Piezas reutilizables
+# ------------------------------------------------------------------------------------
+class BotonCabecera(Static):
+    """Acción clickeable de la cabecera; ocupa una fila y solo el ancho de su texto."""
+
+    class Pulsado(Message):
+        def __init__(self, accion: str) -> None:
+            self.accion = accion
+            super().__init__()
+
+    def __init__(self, etiqueta: str, accion: str, **kwargs) -> None:
+        super().__init__(etiqueta, **kwargs)
+        self._accion = accion
+
+    def on_click(self, event: events.Click) -> None:
+        event.stop()
+        self.post_message(self.Pulsado(self._accion))
+
+
+class AtajosFecha(Horizontal):
+    """Quick-picks de vencimiento, todos clickeables.
+
+    Preferimos esto a un calendario: el date picker mantenido para textual
+    (textual-timepiece) despliega un overlay de 19 filas, que no entra en un pane de 15.
+    """
+
+    OPCIONES: tuple[tuple[str, str], ...] = (
+        ("hoy", "hoy"),
+        ("mañana", "manana"),
+        ("+3 días", "mas3"),
+        ("próx. sem.", "semana"),
+        ("+1 mes", "mes"),
+    )
+
+    class Elegida(Message):
+        def __init__(self, fecha: date) -> None:
+            self.fecha = fecha
+            super().__init__()
+
+    def compose(self) -> ComposeResult:
+        for etiqueta, clave in self.OPCIONES:
+            yield Button(etiqueta, id=f"qp-{clave}", classes="chip")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if not (event.button.id or "").startswith("qp-"):
+            return
+        event.stop()
+        hoy = date.today()
+        elegida = {
+            "hoy": hoy,
+            "manana": hoy + timedelta(days=1),
+            "mas3": hoy + timedelta(days=3),
+            "semana": hoy + timedelta(days=7),
+            "mes": mas_un_mes(hoy),
+        }[event.button.id[3:]]
+        self.post_message(self.Elegida(elegida))
+
+
+class DialogoModal(ModalScreen):
+    """Base de los modales: `esc` cierra y un clic fuera del diálogo también."""
+
+    BINDINGS = [Binding("escape", "cancelar", "volver")]
+
+    def action_cancelar(self) -> None:
+        self.dismiss(None)
+
+    def on_click(self, event: events.Click) -> None:
+        golpeado, _ = self.get_widget_at(event.screen_x, event.screen_y)
+        if golpeado is self:  # el clic cayó en el fondo, no dentro del diálogo
+            event.stop()
+            self.dismiss(None)
+
+
+# ------------------------------------------------------------------------------------
+# Modales
+# ------------------------------------------------------------------------------------
+class DetalleScreen(DialogoModal):
+    """Detalle del issue. Devuelve 'cerrar', 'fecha' o None."""
+
+    def __init__(self, tarea: Tarea) -> None:
+        super().__init__()
+        self.tarea = tarea
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dlg-detalle", classes="dlg"):
+            yield Static(self.tarea.titulo, id="det-titulo")
+            yield Static(
+                f"{self.tarea.cliente} · {fecha_larga(self.tarea.vence, date.today())}",
+                id="det-meta",
+            )
+            with VerticalScroll(id="det-cuerpo"):
+                yield Markdown(self.tarea.cuerpo or "_(sin descripción)_")
+            with Horizontal(classes="fila-botones"):
+                yield Button("cerrar tarea", id="det-cerrar", classes="chip peligro")
+                yield Button("cambiar fecha", id="det-fecha", classes="chip")
+                yield Button("volver", id="det-volver", classes="chip")
+
+    def on_mount(self) -> None:
+        self.query_one("#det-cuerpo").focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.dismiss({"det-cerrar": "cerrar", "det-fecha": "fecha"}.get(event.button.id or ""))
+
+
+class FechaScreen(DialogoModal):
+    """Elegir vencimiento. Devuelve 'AAAA-MM-DD', '' para quitarlo, o None."""
+
+    def __init__(self, titulo: str, actual: date | None) -> None:
+        super().__init__()
+        self.titulo = titulo
+        self.actual = actual
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dlg-fecha", classes="dlg"):
+            yield Static(f"vencimiento · {acortar(self.titulo, 120)}", classes="dlg-titulo")
+            yield AtajosFecha(classes="fila-chips")
+            with Horizontal(classes="fila-botones"):
+                yield Input(
+                    value=self.actual.isoformat() if self.actual else "",
+                    placeholder="AAAA-MM-DD",
+                    id="fecha-input",
+                )
+                yield Button("guardar", id="fecha-guardar", classes="chip")
+                yield Button("quitar", id="fecha-quitar", classes="chip")
+                yield Button("cancelar", id="fecha-cancelar", classes="chip")
+            yield Static("", id="fecha-error", classes="error-linea")
+
+    def on_mount(self) -> None:
+        self.query_one("#fecha-input", Input).focus()
+
+    def on_atajos_fecha_elegida(self, event: AtajosFecha.Elegida) -> None:
+        event.stop()
+        self.dismiss(event.fecha.isoformat())
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._guardar()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if not (event.button.id or "").startswith("fecha-"):
+            return
+        event.stop()
+        if event.button.id == "fecha-guardar":
+            self._guardar()
+        elif event.button.id == "fecha-quitar":
+            self.dismiss("")
+        else:
+            self.dismiss(None)
+
+    def _guardar(self) -> None:
+        texto = self.query_one("#fecha-input", Input).value.strip()
+        if not texto:
+            self.dismiss("")
+            return
+        try:
+            date.fromisoformat(texto)
+        except ValueError:
+            self.query_one("#fecha-error", Static).update("formato inválido, usa AAAA-MM-DD")
+            return
+        self.dismiss(texto)
+
+
+class NuevaScreen(DialogoModal):
+    """Alta de tarea. Devuelve {'repo','titulo','fecha'} o None."""
+
+    def __init__(self, repos: list[str]) -> None:
+        super().__init__()
+        self.repos = repos
+        self.repo_elegido: str | None = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dlg-nueva", classes="dlg"):
+            yield Static("nueva tarea", classes="dlg-titulo")
+            yield Input(placeholder="filtrar cliente/repo…", id="nueva-filtro")
+            yield OptionList(id="nueva-repos")
+            yield Input(placeholder="¿qué te pidieron?", id="nueva-titulo")
+            yield AtajosFecha(classes="fila-chips")
+            with Horizontal(classes="fila-botones"):
+                yield Input(placeholder="AAAA-MM-DD (opcional)", id="nueva-fecha")
+                yield Button("crear", id="nueva-crear", classes="chip")
+                yield Button("cancelar", id="nueva-cancelar", classes="chip")
+            yield Static("", id="nueva-error", classes="error-linea")
+
+    def on_mount(self) -> None:
+        self._pintar_repos(self.repos)
+        self.query_one("#nueva-filtro", Input).focus()
+
+    def _pintar_repos(self, repos: list[str]) -> None:
+        lista = self.query_one("#nueva-repos", OptionList)
+        lista.clear_options()
+        self.repo_elegido = None
+        if not repos:
+            lista.add_option(Option("(sin repos que calcen)", disabled=True))
+            return
+        lista.add_options([Option(r, id=r) for r in repos])
+        lista.highlighted = 0
+        self.repo_elegido = repos[0]
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "nueva-filtro":
+            return
+        event.stop()
+        aguja = event.value.strip().casefold()
+        self._pintar_repos([r for r in self.repos if aguja in r.casefold()])
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        event.stop()
+        if event.option is not None and event.option.id:
+            self.repo_elegido = event.option.id
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        if event.option.id:
+            self.repo_elegido = event.option.id
+        self.query_one("#nueva-titulo", Input).focus()
+
+    def on_atajos_fecha_elegida(self, event: AtajosFecha.Elegida) -> None:
+        event.stop()
+        self.query_one("#nueva-fecha", Input).value = event.fecha.isoformat()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        if event.input.id == "nueva-filtro":
+            self.query_one("#nueva-titulo", Input).focus()
+        else:
+            self._crear()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if not (event.button.id or "").startswith("nueva-"):
+            return
+        event.stop()
+        if event.button.id == "nueva-crear":
+            self._crear()
+        else:
+            self.dismiss(None)
+
+    def _crear(self) -> None:
+        error = self.query_one("#nueva-error", Static)
+        titulo = self.query_one("#nueva-titulo", Input).value.strip()
+        fecha = self.query_one("#nueva-fecha", Input).value.strip()
+        if not self.repo_elegido:
+            error.update("elige un cliente/repo de la lista")
+            return
+        if not titulo:
+            error.update("falta el título")
+            self.query_one("#nueva-titulo", Input).focus()
+            return
+        if fecha:
+            try:
+                date.fromisoformat(fecha)
+            except ValueError:
+                error.update("fecha inválida, usa AAAA-MM-DD")
+                return
+        self.dismiss({"repo": self.repo_elegido, "titulo": titulo, "fecha": fecha})
+
+
+class ConfirmaScreen(DialogoModal):
+    """Confirmación de una acción destructiva. Devuelve True/False."""
+
+    def __init__(self, pregunta: str) -> None:
+        super().__init__()
+        self.pregunta = pregunta
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dlg-confirma", classes="dlg"):
+            yield Static(self.pregunta, classes="dlg-titulo")
+            with Horizontal(classes="fila-botones"):
+                yield Button("sí, cerrar", id="ok", classes="chip peligro")
+                yield Button("cancelar", id="no", classes="chip")
+
+    def on_mount(self) -> None:
+        self.query_one("#no", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.dismiss(event.button.id == "ok")
+
+
+# ------------------------------------------------------------------------------------
+# Pantalla principal
+# ------------------------------------------------------------------------------------
+class ListaScreen(Screen):
+    BINDINGS = [
+        # priority: DataTable también usa enter, y sin esto su binding (oculto) gana
+        # el desempate y el footer se queda sin la pista más importante.
+        Binding("enter", "ver", "ver", priority=True),
+        Binding("n", "nueva", "nueva"),
+        Binding("d", "fecha", "fecha"),
+        Binding("x", "cerrar", "cerrar"),
+        Binding("r", "refrescar", "refrescar"),
+        Binding("q", "salir", "salir"),
+        Binding("j", "abajo", "", show=False),
+        Binding("k", "arriba", "", show=False),
+    ]
+
+    def __init__(self, backend: Backend) -> None:
+        super().__init__()
+        self.backend = backend
+        self.tareas: list[Tarea] = []
+        self.repos: list[str] = []
+        self.ultimo_ok: datetime | None = None
+        self.ultimo_error: str | None = None
+        self.cargando = True
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="cabecera"):
+            yield Static("", id="cab-titulo")
+            yield BotonCabecera("+ nueva", "nueva", id="cab-nueva", classes="cab-btn")
+            yield BotonCabecera("⟳", "refrescar", id="cab-refrescar", classes="cab-btn")
+        tabla: DataTable = DataTable(id="tabla")
+        tabla.cursor_type = "row"
+        tabla.show_header = False
+        yield tabla
+        yield Static("", id="vacio")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        tabla = self.query_one("#tabla", DataTable)
+        tabla.add_column("vence", width=ANCHO_VENCE, key="vence")
+        tabla.add_column("cliente", width=ANCHO_CLIENTE_MAX, key="cliente")
+        tabla.add_column("título", width=40, key="titulo")
+        self._pintar_vacio()
+        self._pintar_cabecera()
+        self.refrescar()
+        self.cargar_repos()
+        self.set_interval(REFRESCO_SEGUNDOS, self.refrescar)
+        self.set_interval(20.0, self._pintar_cabecera)
+
+    # ------------------------------------------------------------------ datos
+    @work(exclusive=True, group="listar")
+    async def refrescar(self) -> None:
+        try:
+            self.tareas = await self.backend.listar()
+            self.ultimo_ok = datetime.now()
+            self.ultimo_error = None
+        except Exception as err:  # noqa: BLE001 - cualquier fallo va a la UI, no al log
+            self.ultimo_error = str(err)
+            self.notify(f"no pude leer el Project: {err}", severity="error", timeout=6)
+        finally:
+            self.cargando = False
+            self._pintar_tabla()
+
+    @work(exclusive=True, group="repos")
+    async def cargar_repos(self) -> None:
+        try:
+            self.repos = await self.backend.repos()
+        except Exception:  # noqa: BLE001 - sin repos el modal lo dice y sigue
+            self.repos = []
+
+    # ------------------------------------------------------------------ pintado
+    def _pintar_tabla(self) -> None:
+        tabla = self.query_one("#tabla", DataTable)
+        recordado = tabla.cursor_row
+        tabla.clear()
+
+        vacio = not self.tareas
+        tabla.display = not vacio
+        self.query_one("#vacio", Static).display = vacio
+        self._pintar_vacio()
+        self._pintar_cabecera()
+        if vacio:
+            return
+
+        # Responsive: los anchos se derivan del pane, nunca son fijos.
+        util = max(tabla.scrollable_content_region.width or self.size.width, 24)
+        relleno = 2 * tabla.cell_padding
+        disponible = util - ANCHO_VENCE - 3 * relleno
+        # La columna de cliente se ajusta al contenido real: si sobra, el hueco se lo
+        # queda el título, que es lo que se lee.
+        largo_cliente = max((len(t.cliente) for t in self.tareas), default=ANCHO_CLIENTE_MIN)
+        ancho_cliente = max(
+            ANCHO_CLIENTE_MIN, min(ANCHO_CLIENTE_MAX, largo_cliente, disponible // 3)
+        )
+        ancho_titulo = max(6, disponible - ancho_cliente)
+
+        claves = list(tabla.columns)
+        tabla.columns[claves[1]].width = ancho_cliente
+        tabla.columns[claves[2]].width = ancho_titulo
+
+        hoy = date.today()
+        for tarea in self.tareas:
+            texto, estilo = etiqueta_vencimiento(tarea.vence, hoy)
+            tabla.add_row(
+                Text(texto, style=estilo),
+                Text(acortar(tarea.cliente, ancho_cliente), style="dim"),
+                Text(acortar(tarea.titulo, ancho_titulo)),
+                key=tarea.item_id,
+            )
+        if recordado:
+            tabla.cursor_coordinate = Coordinate(min(recordado, len(self.tareas) - 1), 0)
+
+    def _pintar_vacio(self) -> None:
+        widget = self.query_one("#vacio", Static)
+        if self.cargando:
+            widget.update(Text("cargando tareas…", style="dim"))
+        elif self.ultimo_error:
+            widget.update(
+                Text.assemble(
+                    ("no pude leer el Project\n", "bold red"),
+                    (f"{acortar(self.ultimo_error, 120)}\n\n", "dim"),
+                    ("pulsa r o haz clic en ⟳ para reintentar", "dim"),
+                )
+            )
+        else:
+            widget.update(
+                Text.assemble(
+                    ("✓  sin tareas pendientes\n\n", "bold green"),
+                    ("pulsa n o haz clic en «+ nueva» para agregar una", "dim"),
+                )
+            )
+
+    def _pintar_cabecera(self) -> None:
+        cuantas = len(self.tareas)
+        if self.cargando:
+            estado = "cargando…"
+        elif self.ultimo_error:
+            estado = "sin conexión"
+        elif cuantas == 0:
+            estado = "sin pendientes"
+        else:
+            estado = f"{cuantas} pendiente{'s' if cuantas != 1 else ''}"
+        self.query_one("#cab-titulo", Static).update(
+            Text.assemble(("tareas de clientes", "bold"), ("  ·  ", "dim"), (estado, "yellow"))
+        )
+        self.query_one("#cab-refrescar", BotonCabecera).update(
+            Text(f"⟳ {self._hace_cuanto()}", style="dim")
+        )
+
+    def _hace_cuanto(self) -> str:
+        if self.ultimo_ok is None:
+            return "—"
+        minutos = int((datetime.now() - self.ultimo_ok).total_seconds() // 60)
+        return "recién" if minutos < 1 else f"hace {minutos}m"
+
+    def on_resize(self, event: events.Resize) -> None:
+        if self.tareas:
+            self.call_after_refresh(self._pintar_tabla)
+
+    # ------------------------------------------------------------------ interacción
+    @property
+    def seleccionada(self) -> Tarea | None:
+        if not self.tareas:
+            return None
+        fila = self.query_one("#tabla", DataTable).cursor_row
+        return self.tareas[fila] if 0 <= fila < len(self.tareas) else None
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        # DataTable ya distingue solo: un clic en otra fila mueve el cursor y un clic
+        # en la fila ya seleccionada (o un doble clic, o enter) llega hasta acá.
+        event.stop()
+        self.action_ver()
+
+    def on_boton_cabecera_pulsado(self, event: BotonCabecera.Pulsado) -> None:
+        event.stop()
+        self.action_nueva() if event.accion == "nueva" else self.action_refrescar()
+
+    def action_abajo(self) -> None:
+        self.query_one("#tabla", DataTable).action_cursor_down()
+
+    def action_arriba(self) -> None:
+        self.query_one("#tabla", DataTable).action_cursor_up()
+
+    def action_refrescar(self) -> None:
+        self.refrescar()
+
+    def action_salir(self) -> None:
+        self.app.exit()
+
+    @work
+    async def action_ver(self) -> None:
+        tarea = self.seleccionada
+        if tarea is None:
+            return
+        siguiente = await self.app.push_screen_wait(DetalleScreen(tarea))
+        if siguiente == "cerrar":
+            await self._cerrar(tarea)
+        elif siguiente == "fecha":
+            await self._fechar(tarea)
+
+    @work
+    async def action_fecha(self) -> None:
+        tarea = self.seleccionada
+        if tarea is None:
+            self.notify("no hay tarea seleccionada", severity="warning", timeout=3)
+            return
+        await self._fechar(tarea)
+
+    @work
+    async def action_cerrar(self) -> None:
+        tarea = self.seleccionada
+        if tarea is None:
+            self.notify("no hay tarea seleccionada", severity="warning", timeout=3)
+            return
+        await self._cerrar(tarea)
+
+    @work
+    async def action_nueva(self) -> None:
+        if not self.repos:
+            self.cargar_repos()
+        datos = await self.app.push_screen_wait(NuevaScreen(self.repos))
+        if not datos:
+            return
+        try:
+            await self.backend.crear(datos["repo"], datos["titulo"], datos["fecha"] or None)
+        except (ErrorGh, IndexError, OSError) as err:
+            self.notify(f"no pude crear la tarea: {err}", severity="error", timeout=6)
+            return
+        self.notify("tarea creada", timeout=3)
+        self.refrescar()
+
+    async def _fechar(self, tarea: Tarea) -> None:
+        nueva = await self.app.push_screen_wait(FechaScreen(tarea.titulo, tarea.vence))
+        if nueva is None:
+            return
+        try:
+            await self.backend.fechar(tarea.item_id, nueva or None)
+        except (ErrorGh, OSError) as err:
+            self.notify(f"no pude cambiar la fecha: {err}", severity="error", timeout=6)
+            return
+        self.notify("vencimiento actualizado" if nueva else "vencimiento quitado", timeout=3)
+        self.refrescar()
+
+    async def _cerrar(self, tarea: Tarea) -> None:
+        pregunta = f"¿cerrar «{acortar(tarea.titulo, 60)}»?"
+        if not await self.app.push_screen_wait(ConfirmaScreen(pregunta)):
+            return
+        try:
+            await self.backend.cerrar(tarea)
+        except (ErrorGh, OSError) as err:
+            self.notify(f"no pude cerrar la tarea: {err}", severity="error", timeout=6)
+            return
+        self.notify(f"cerrada {tarea.cliente}", timeout=3)
+        self.refrescar()
+
+
+# ------------------------------------------------------------------------------------
+# App
+# ------------------------------------------------------------------------------------
+class TareasApp(App):
+    TITLE = "tareas de clientes"
+    # En un pane chico cada columna del footer cuenta, y la paleta no aporta acá.
+    ENABLE_COMMAND_PALETTE = False
+
+    CSS = """
+    Screen { background: $background; }
+
+    #cabecera { height: 1; width: 100%; }
+    #cab-titulo { width: 1fr; height: 1; }
+    .cab-btn { width: auto; height: 1; padding: 0 1; color: $accent; }
+    .cab-btn:hover { background: $panel; text-style: bold; }
+
+    #tabla { height: 1fr; width: 100%; scrollbar-size-vertical: 1; }
+    #vacio {
+        display: none; height: 1fr; width: 100%;
+        content-align: center middle; text-align: center;
+    }
+    Footer { height: 1; }
+
+    /* Modales: todo relativo al viewport, nada con medidas fijas. */
+    DialogoModal { align: center middle; }
+    .dlg {
+        background: $surface; border: round $accent; padding: 0 1;
+        width: 90%; max-width: 100; height: auto; max-height: 90%;
+    }
+    .dlg-titulo { height: 1; color: $accent; text-style: bold; }
+    .fila-chips { height: 1; width: 100%; }
+    .fila-botones { height: 1; width: 100%; }
+    .error-linea { height: auto; color: $error; }
+
+    /* Botones de una fila: clickeables sin engordar la UI. */
+    /* El fondo va literal (color 8) y no por variable: las variables propias del theme
+       todavía no existen cuando se parsea App.CSS. Sobre el panel del modal (color 0)
+       queda un escalón visible, así que los botones se leen como botones. */
+    .chip {
+        height: 1; min-width: 0; width: auto; border: none;
+        padding: 0 1; margin: 0 1 0 0; background: ansi_bright_black; color: $foreground;
+        text-style: none;
+    }
+    .chip:hover { background: $accent; color: $background; text-style: bold; }
+    .chip:focus { text-style: bold reverse; }
+    .peligro { color: $error; }
+    .peligro:hover { background: $error; color: $background; }
+
+    #dlg-detalle { height: 90%; }
+    #det-titulo { height: auto; max-height: 2; text-style: bold; }
+    #det-meta { height: 1; color: $accent; }
+    #det-cuerpo {
+        height: 1fr; width: 100%; scrollbar-size-vertical: 1; border-top: solid $panel;
+    }
+
+    /* auto (no 1fr) para que la lista abrace a sus opciones y no deje hueco muerto */
+    #nueva-repos {
+        height: auto; max-height: 6; border: none; background: $background;
+    }
+    #nueva-filtro, #nueva-titulo, #nueva-fecha, #fecha-input {
+        height: 1; border: none; padding: 0 1; background: $background; width: 1fr;
+    }
+    #nueva-fecha, #fecha-input { max-width: 24; }
+    """
+
+    def __init__(self, backend: Backend) -> None:
+        super().__init__()
+        self.backend = backend
+
+    def get_default_screen(self) -> Screen:
+        return ListaScreen(self.backend)
+
+    def on_mount(self) -> None:
+        self.register_theme(THEME_TERMINAL)
+        self.theme = "terminal"
