@@ -1,0 +1,21 @@
+# entornos
+venv/
+venv.nosync/
+.venv/
+*.nosync
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# configuración local (nunca se versiona)
+config.toml
+ids-cache.json
+
+# herramientas
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
