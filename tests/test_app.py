@@ -8,13 +8,15 @@ siguiente ocurrencia).
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import date, timedelta
 
 import pytest
 from textual.coordinate import Coordinate
-from textual.widgets import Button, Input
+from textual.widgets import Button, Input, OptionList
 
+from tareas_tui import datos
 from tareas_tui.app import (
     ConfirmaScreen,
     DetalleScreen,
@@ -249,16 +251,19 @@ async def test_ningun_chip_se_sale_de_su_fila(size, tecla, contenedor):
 
 # ------------------------------------------------------------------ contraste del cursor
 async def test_la_fila_bajo_el_cursor_se_lee_entera_sin_dim():
-    """El bug que motivó `TablaTareas`: la columna de repo va en `dim` y sobre el fondo
-    ámbar del cursor se difuminaba hasta quedar ilegible. Bajo el cursor no debe
-    sobrevivir ningún `dim`, y todo el texto de la fila comparte el color del cursor."""
+    """El bug que motivó `TablaTareas`: una celda en `dim` se difuminaba sobre el fondo
+    ámbar del cursor hasta quedar ilegible. Bajo el cursor no debe sobrevivir ningún
+    `dim`, y todo el texto de la fila comparte el color del cursor.
+
+    Desde el cambio de contraste ya ninguna celda se pinta en `dim` -repo y vencimientos
+    pasaron al color 7-, así que `TablaTareas` quedó de guarda por si alguna vuelve."""
     app = TareasApp(BackendDemo())
     async with app.run_test(size=(110, 24)) as pilot:
         screen = await _listo(pilot)
         tabla = screen.query_one("#tabla", TablaTareas)
         assert tabla.has_focus
 
-        await pilot.press("j")  # fila 1: repetitiva, con marca ↻ y repo en dim
+        await pilot.press("j")  # fila 1: repetitiva, con marca ↻
         await pilot.pause()
         assert tabla.cursor_row == 1
 
@@ -268,9 +273,11 @@ async def test_la_fila_bajo_el_cursor_se_lee_entera_sin_dim():
         assert all(not s.style.dim for s in bajo_cursor)
         assert {s.style.color for s in bajo_cursor} == {color_cursor}
 
-        # control: fuera del cursor el dim sigue vivo, que es lo que da la jerarquía
+        # control: fuera del cursor cada fila conserva SUS colores (la jerarquía), en vez
+        # de quedar aplanada al color del cursor.
         otra_fila = [s for s in tabla.render_line(0) if s.text.strip()]
-        assert any(s.style.dim for s in otra_fila)
+        assert otra_fila
+        assert {s.style.color for s in otra_fila} != {color_cursor}
 
 
 # ------------------------------------------------------------------ respiración adaptativa
@@ -811,3 +818,383 @@ async def test_header_sin_vencidas_no_agrega_overdue():
         texto = screen.query_one("#cab-titulo").content.plain
         assert "1 pending" in texto
         assert "overdue" not in texto
+
+
+# ------------------------------------------------------------------ cursor por identidad
+async def test_el_cursor_sigue_a_su_tarea_aunque_la_lista_se_reordene():
+    """`_pintar_tabla` recordaba el NÚMERO de fila, pero `ordenar()` resortea por
+    (vence, título): tras fechar una tarea el cursor quedaba sobre otra y un `x`
+    inmediato cerraba la equivocada."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        await pilot.press("j", "j", "j", "j")  # a media lista, lejos de los extremos
+        tarea = screen.seleccionada
+        assert tarea is not None and tarea.vence is not None
+
+        atrasada = date.today() - timedelta(days=30)  # la manda a la primera fila
+        await pilot.press("d")
+        await pilot.pause()
+        assert isinstance(pilot.app.screen, FechaScreen)
+        pilot.app.screen.query_one("#fecha-input", Input).value = atrasada.isoformat()
+        await pilot.press("ctrl+enter")
+        await _esperar(
+            pilot,
+            lambda: any(
+                t.item_id == tarea.item_id and t.vence == atrasada for t in screen.tareas
+            ),
+        )
+        await pilot.pause()
+
+        assert screen.visibles[0].item_id == tarea.item_id  # se movió de fila…
+        assert screen.seleccionada.item_id == tarea.item_id  # …y el cursor la siguió
+
+
+async def test_si_la_tarea_del_cursor_desaparece_el_cursor_cae_en_una_valida():
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        await pilot.press("G")
+        tarea = screen.seleccionada
+
+        await pilot.press("x")
+        await pilot.pause()
+        await pilot.press("y")
+        await _esperar(pilot, lambda: all(t.item_id != tarea.item_id for t in screen.tareas))
+        await pilot.pause()
+
+        tabla = screen.query_one("#tabla", TablaTareas)
+        assert tabla.cursor_row == len(screen.visibles) - 1
+        assert screen.seleccionada is not None
+
+
+# ------------------------------------------------------------------ escrituras en vuelo
+class BackendCierreLento(BackendDemo):
+    """Demo cuyo cierre no termina hasta que se suelta el evento: deja ver la ventana
+    en la que la fila sigue viva mientras corren las llamadas a `gh`."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.suelta = asyncio.Event()
+        self.cierres: list[str] = []
+
+    async def cerrar(self, tarea):
+        self.cierres.append(tarea.item_id)
+        await self.suelta.wait()
+        await super().cerrar(tarea)
+
+
+async def test_un_segundo_x_no_vuelve_a_cerrar_la_tarea_en_curso():
+    """`action_cerrar` no era exclusiva y la fila seguía visible mientras corrían las 3
+    llamadas a gh: un segundo `x` abría otro ConfirmaScreen sobre la MISMA tarea. Como
+    `gh issue close` sobre un issue ya cerrado sale 0, el segundo cierre "funcionaba" y
+    `_repetir` creaba una ocurrencia duplicada de verdad."""
+    backend = BackendCierreLento()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        await pilot.press("j")  # la mensual: duplicarla se ve en la ocurrencia siguiente
+        tarea = screen.seleccionada
+        assert tarea.repeat == "monthly"
+
+        await pilot.press("x")
+        await pilot.pause()
+        await pilot.press("y")
+        await _esperar(pilot, lambda: bool(backend.cierres))
+        assert backend.cierres == [tarea.item_id]
+
+        await pilot.press("x")  # la fila sigue ahí, pero el cierre ya está en vuelo
+        await pilot.pause()
+        await pilot.pause()
+        assert not isinstance(pilot.app.screen, ConfirmaScreen)
+
+        backend.suelta.set()
+        await _esperar(pilot, lambda: all(t.item_id != tarea.item_id for t in screen.tareas))
+        await _esperar(pilot, lambda: any(t.titulo == tarea.titulo for t in screen.tareas))
+        assert backend.cierres == [tarea.item_id]
+        assert len([t for t in screen.tareas if t.titulo == tarea.titulo]) == 1
+
+
+async def test_la_fila_avisa_mientras_se_cierra_la_tarea():
+    backend = BackendCierreLento()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        tarea = screen.seleccionada
+
+        await pilot.press("x")
+        await pilot.pause()
+        await pilot.press("y")
+        await _esperar(pilot, lambda: bool(backend.cierres))
+        await pilot.pause()
+
+        tabla = screen.query_one("#tabla", TablaTareas)
+        fila = next(i for i, t in enumerate(screen.visibles) if t.item_id == tarea.item_id)
+        assert tabla.get_cell_at(Coordinate(fila, 0)).plain == "closing…"
+
+        backend.suelta.set()
+        await _esperar(pilot, lambda: all(t.item_id != tarea.item_id for t in screen.tareas))
+
+
+# ------------------------------------------------------------------ efectos parciales
+async def test_el_alta_a_medias_no_se_reporta_como_no_creada():
+    """El issue ya existe en GitHub: decir "couldn't create the task" empuja a
+    reintentar y duplicar."""
+    app = TareasApp(BackendDemo(repo_actual="vela/landing"))
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+
+        async def a_medias(repo, titulo, fecha, cuerpo=""):
+            raise datos.ErrorParcial(
+                "the new issue exists on GitHub but wasn't added to the board "
+                "— check GitHub (HTTP 502)"
+            )
+
+        screen.backend.crear = a_medias
+        await pilot.press("n")
+        await pilot.pause()
+        pilot.app.screen.query_one("#nueva-titulo", Input).value = "Half created"
+        await pilot.press("ctrl+enter")
+        await _esperar(
+            pilot, lambda: any("wasn't added to the board" in m for m in _avisos(pilot.app))
+        )
+        assert any("wasn't added to the board" in m for m in _avisos(pilot.app))
+        assert not any("couldn't create the task" in m for m in _avisos(pilot.app))
+
+
+async def test_la_ocurrencia_a_medias_no_se_reporta_como_no_creada():
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+
+        async def a_medias(tarea, hoy):
+            raise datos.ErrorParcial(
+                "the new issue was created without a due date (HTTP 500)"
+            )
+
+        screen.backend.repetir = a_medias
+        await pilot.press("j")
+        assert screen.seleccionada.repeat == "monthly"
+
+        await pilot.press("x")
+        await pilot.pause()
+        await pilot.press("y")
+        await _esperar(
+            pilot, lambda: any("without a due date" in m for m in _avisos(pilot.app))
+        )
+        assert any("without a due date" in m for m in _avisos(pilot.app))
+        assert not any(
+            "couldn't create the next occurrence" in m for m in _avisos(pilot.app)
+        )
+
+
+# ------------------------------------------------------------------ picker de repos
+class BackendReposLentos(BackendDemo):
+    """Demo cuyo listado de repos no vuelve hasta que se suelta el evento."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.suelta = asyncio.Event()
+
+    async def repos(self) -> list[str]:
+        await self.suelta.wait()
+        return await super().repos()
+
+
+async def test_el_picker_se_llena_aunque_el_modal_abra_antes_que_la_carga():
+    """`action_nueva` pasaba `self.repos` por valor y `cargar_repos` REASIGNABA el
+    atributo: el modal abierto antes de que llegaran se quedaba vacío para siempre."""
+    backend = BackendReposLentos()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = pilot.app.screen
+        await _esperar(pilot, lambda: not screen.cargando)
+        assert screen.repos == []  # la carga de repos sigue en vuelo
+
+        await pilot.press("n")
+        await pilot.pause()
+        modal = pilot.app.screen
+        assert isinstance(modal, NuevaScreen)
+        lista = modal.query_one("#nueva-repos", OptionList)
+        assert "loading repos" in str(lista.get_option_at_index(0).prompt)
+
+        backend.suelta.set()
+        await _esperar(pilot, lambda: bool(modal.repos))
+        assert modal.repos == ["acme/web", "korta/api", "lumen/shop", "mesa/intranet", "vela/landing"]
+        assert lista.option_count == 5
+        assert modal.repo_elegido == "acme/web"
+
+
+# ------------------------------------------------------------------ límite del Project
+class BackendTruncado(BackendDemo):
+    truncado = True
+
+
+async def test_la_ui_avisa_cuando_el_project_llega_al_limite():
+    app = TareasApp(BackendTruncado())
+    async with app.run_test() as pilot:
+        await _listo(pilot)
+        await _esperar(pilot, lambda: any("item limit" in m for m in _avisos(pilot.app)))
+        assert any("item limit" in m for m in _avisos(pilot.app))
+
+
+async def test_sin_truncado_no_hay_aviso_de_limite():
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        await _listo(pilot)
+        assert not any("item limit" in m for m in _avisos(pilot.app))
+
+
+# ------------------------------------------------------------------ red caída
+class BackendCaido(BackendDemo):
+    async def listar(self):
+        raise ErrorGh("`gh` didn't respond in 30s (check your connection).")
+
+
+async def test_un_error_al_listar_reemplaza_el_spinner_por_un_mensaje():
+    """Guarda del cuelgue infinito: con el timeout de `gh`, «loading tasks…» ahora
+    termina siempre en un mensaje accionable en vez de quedarse girando."""
+    app = TareasApp(BackendCaido())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = pilot.app.screen
+        await _esperar(pilot, lambda: not screen.cargando)
+        texto = screen.query_one("#vacio").content.plain
+        assert "couldn't read the Project" in texto
+        assert "didn't respond" in texto
+        assert "loading tasks…" not in texto
+        assert "press r or click ⟳ to retry" in texto
+
+
+# ------------------------------------------------------------------ contraste secundario
+def _pintado(widget) -> list:
+    return [
+        segmento
+        for y in range(widget.size.height)
+        for segmento in widget.render_line(y)
+        if segmento.text.strip()
+    ]
+
+
+def _es_color_7(segmento) -> bool:
+    """Color 7 de la paleta del terminal, NO un #ffffff fijo: si se colara un truecolor
+    la app dejaría de heredar la paleta y el texto sería invisible en claro."""
+    return not segmento.style.dim and segmento.style.color.number == 7
+
+
+async def test_el_texto_secundario_de_la_lista_no_va_en_dim():
+    """`dim` en esta paleta cae a 3,98:1 sobre fondo claro. El texto secundario que se
+    LEE (repo, timestamp del refresco) va en el color 7, que mide 7,38:1 en claro y
+    10,72:1 en oscuro sin perder jerarquía contra el texto normal."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        tabla = screen.query_one("#tabla", TablaTareas)
+        await pilot.press("j")  # el cursor pisa el color de su fila: se corre a la 1
+        await pilot.pause()
+
+        repo = [s for s in tabla.render_line(0) if "landing#31" in s.text]
+        assert repo
+        assert all(_es_color_7(s) for s in repo)
+
+        segmentos = _pintado(screen.query_one("#cab-refrescar"))
+        assert segmentos
+        assert all(_es_color_7(s) for s in segmentos)
+
+
+async def test_los_hints_del_estado_vacio_no_van_en_dim():
+    app = TareasApp(vacio_demo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        segmentos = _pintado(screen.query_one("#vacio"))
+        assert segmentos
+        assert all(not s.style.dim for s in segmentos)
+        hint = [s for s in segmentos if "+ new" in s.text]
+        assert hint
+        assert all(_es_color_7(s) for s in hint)
+
+
+async def test_los_hints_y_los_botones_secundarios_de_los_modales_no_van_en_dim():
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        await pilot.press("d")
+        await pilot.pause()
+        modal = pilot.app.screen
+        for selector in ("#fecha-hint", "#fecha-cancelar"):
+            segmentos = _pintado(modal.query_one(selector))
+            assert segmentos, selector
+            assert all(_es_color_7(s) for s in segmentos), selector
+
+
+async def test_la_jerarquia_de_vencimientos_se_lee_entera():
+    """El vencimiento es el dato más importante de la fila y "in 19d"/"—" iban en `dim`,
+    lo más lavado de la pantalla. La jerarquía queda: vencida (rojo bold) > hoy (acento
+    bold) > próxima (acento) > lejana o sin fecha (color 7). Ninguna en dim."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        tabla = screen.query_one("#tabla", TablaTareas)
+        assert tabla.cursor_row == 0  # la fila 0 la pinta el cursor: se mira de la 1 abajo
+
+        def vence(fila: int, esperado: str):
+            columna = [s for s in tabla.render_line(fila) if s.text.strip()][0]
+            assert columna.text.strip() == esperado, (fila, columna.text)
+            assert not columna.style.dim, (fila, esperado)
+            return columna
+
+        vencida = vence(1, "3d ago")
+        assert vencida.style.color.number == 1 and vencida.style.bold
+
+        hoy = vence(2, "today")
+        assert hoy.style.color.number == 3 and hoy.style.bold
+
+        proxima = vence(3, "in 2d")
+        assert proxima.style.color.number == 3
+
+        for fila, esperado in ((5, "in 19d"), (6, "—")):
+            assert _es_color_7(vence(fila, esperado)), esperado
+
+
+async def test_los_placeholders_de_los_inputs_se_leen():
+    """El theme ansi de Textual pinta los placeholders con `text-style: dim` sobre
+    ansi_default (Input.DEFAULT_CSS, rama `&:ansi`): el mismo problema de contraste.
+    El texto ya escrito y el cursor no se tocan."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        await pilot.press("n")
+        await pilot.pause()
+        modal = pilot.app.screen
+
+        # "#nueva-filtro" tiene el foco: su primer carácter lo pinta el cursor, así que
+        # se mira desde el segundo.
+        for selector, aguja in (
+            ("#nueva-filtro", "ilter repo"),
+            ("#nueva-titulo", "what did they ask for?"),
+            ("#nueva-notas", "notes (optional)"),
+            ("#nueva-fecha", "YYYY-MM-DD (optional)"),
+        ):
+            campo = modal.query_one(selector, Input)
+            segmentos = [s for s in campo.render_line(0) if aguja in s.text]
+            assert segmentos, selector
+            assert all(_es_color_7(s) for s in segmentos), selector
+
+        titulo = modal.query_one("#nueva-titulo", Input)
+        titulo.focus()
+        await pilot.pause()
+        await pilot.press("h", "o", "l", "a")
+        await pilot.pause()
+        escrito = [s for s in titulo.render_line(0) if "hola" in s.text]
+        assert escrito
+        # el texto real va al color del terminal (contraste pleno), no al secundario
+        assert all(not s.style.dim and s.style.color.number is None for s in escrito)
+
+
+async def test_los_separadores_decorativos_siguen_en_dim():
+    """Lo que NO se lee -el " · " del header- se queda en dim: es lo que mantiene la
+    jerarquía sin costar legibilidad."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        segmentos = _pintado(screen.query_one("#cab-titulo"))
+        assert any(s.style.dim and not s.text.strip(" ·") for s in segmentos)

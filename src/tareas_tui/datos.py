@@ -9,15 +9,42 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import contextlib
 import json
 import re
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 
+from rich.color import Color as ColorRich
+from rich.style import Style
+
 from .config import Config
 
 ANCHO_VENCE = 9  # "hace 120d" es el string más largo que generamos
 ANCHO_REPEAT = 1  # la marca ↻ de las tareas repetitivas
+
+# Estilo del texto secundario que igual se LEE: vencimientos lejanos o ausentes, repo de
+# cada fila, hints accionables, timestamp del refresco. Reemplaza a `dim`, que se pinta
+# mezclando texto y fondo y en esta paleta cae a 2,7:1 en claro y 4,0:1 en oscuro. El
+# color 7 mide 7,38:1 en claro y 10,72:1 en oscuro, y sigue por debajo del texto normal
+# (10,24:1 / 12,30:1), así que la jerarquía se mantiene. (`ansi_bright_black` no sirve:
+# 1,4-1,7:1, ilegible.)
+#
+# Va como objeto Style y no como nombre porque los dos pipelines de render de Textual
+# leen los nombres al revés: en una celda de DataTable (rich) "white" es el color 7 y
+# "ansi_white" se ignora; en un Static (Content) "ansi_white" es el color 7 y "white"
+# es un #ffffff fijo, que rompería la herencia de la paleta en un terminal claro.
+SECUNDARIO = Style(color=ColorRich.from_ansi(7))
+
+# Techo de espera de cualquier llamada a `gh`. Mismo valor que el `subprocess.run` de
+# config.py: con la red muerta `gh` no vuelve nunca, y sin techo la app se quedaba en
+# "loading tasks…" para siempre, sumando un proceso huérfano por ciclo de refresco.
+TIMEOUT_GH = 30.0
+
+# Items que pedimos del Project. GitHub aplica el límite ANTES de que descartemos las
+# hechas, así que hay que dejar margen para las Done acumuladas; `Backend.truncado`
+# avisa si aun así tocamos el techo.
+LIMITE_ITEMS = 1000
 
 # Intervalos de repetición, en el orden en que los cicla el chip del modal.
 REPETICIONES: tuple[str, ...] = ("none", "daily", "weekly", "biweekly", "monthly")
@@ -35,11 +62,40 @@ class ErrorGh(Exception):
     """`gh` terminó con error; el mensaje trae la última línea de stderr."""
 
 
+class ErrorParcial(ErrorGh):
+    """La operación dejó un efecto a medias en GitHub.
+
+    Una alta son dos o tres llamadas a `gh` que no son atómicas: si falla la segunda,
+    el issue ya existe. Decir "couldn't create the task" empuja al usuario a reintentar
+    y a duplicar, así que estos errores llevan el mensaje de lo que SÍ quedó hecho.
+    """
+
+
+async def _matar(proc: asyncio.subprocess.Process) -> None:
+    """Mata el `gh` en curso: cancelar el worker no mata su subproceso."""
+    if proc.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    with contextlib.suppress(asyncio.CancelledError):
+        await proc.wait()
+
+
 async def gh(*args: str) -> str:
+    limite = TIMEOUT_GH  # se lee acá para que un test pueda bajarlo
     proc = await asyncio.create_subprocess_exec(
         "gh", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    salida, error = await proc.communicate()
+    try:
+        salida, error = await asyncio.wait_for(proc.communicate(), limite)
+    except TimeoutError as err:
+        await _matar(proc)
+        raise ErrorGh(
+            f"`gh` didn't respond in {limite:.0f}s (check your connection)."
+        ) from err
+    except asyncio.CancelledError:
+        await _matar(proc)
+        raise
     if proc.returncode != 0:
         detalle = error.decode("utf-8", "replace").strip().splitlines()
         raise ErrorGh(detalle[-1][:200] if detalle else f"gh exited with {proc.returncode}")
@@ -139,10 +195,16 @@ def proxima_fecha(base: date, repeat: str, hoy: date) -> date:
 
 
 # ------------------------------------------------------------------ format (en)
-def etiqueta_vencimiento(vence: date | None, hoy: date) -> tuple[str, str]:
-    """Devuelve (texto, estilo rich). Máximo ANCHO_VENCE caracteres."""
+def etiqueta_vencimiento(vence: date | None, hoy: date) -> tuple[str, str | Style]:
+    """Devuelve (texto, estilo rich). Máximo ANCHO_VENCE caracteres.
+
+    La jerarquía se lee de un vistazo: vencida (rojo bold) > hoy (acento bold) >
+    próxima (acento) > lejana o sin fecha (color 7). Ninguna va en `dim`: el
+    vencimiento es el dato más importante de la fila, y `dim` lo dejaba en lo más
+    lavado de la pantalla justo cuando hay que leerlo.
+    """
     if vence is None:
-        return "—", "dim"
+        return "—", SECUNDARIO
     dias = (vence - hoy).days
     if dias < 0:
         return f"{-dias}d ago"[:ANCHO_VENCE], "bold red"
@@ -152,7 +214,7 @@ def etiqueta_vencimiento(vence: date | None, hoy: date) -> tuple[str, str]:
         return "tomorrow", "yellow"
     if dias <= 7:
         return f"in {dias}d", "yellow"
-    return f"in {dias}d"[:ANCHO_VENCE], "dim"
+    return f"in {dias}d"[:ANCHO_VENCE], SECUNDARIO
 
 
 def fecha_larga(vence: date | None, hoy: date) -> str:
@@ -181,6 +243,9 @@ def acortar(texto: str, ancho: int) -> str:
 class Backend:
     """Lee y escribe el Project real con `gh`."""
 
+    #: La última lectura tocó `LIMITE_ITEMS`: puede haber pendientes fuera de la lista.
+    truncado = False
+
     def __init__(self, config: Config) -> None:
         self.config = config
 
@@ -192,10 +257,14 @@ class Backend:
         cfg = self.config
         crudo = await gh(
             "project", "item-list", cfg.project,
-            "--owner", cfg.owner, "--format", "json", "--limit", "200",
+            "--owner", cfg.owner, "--format", "json", "--limit", str(LIMITE_ITEMS),
         )
+        items = json.loads(crudo or "{}").get("items", [])
+        # Se cuenta ANTES de filtrar: el límite lo aplica GitHub sobre el Project entero,
+        # hechas incluidas, así que tocar el techo puede estar escondiendo pendientes.
+        self.truncado = len(items) >= LIMITE_ITEMS
         tareas: list[Tarea] = []
-        for item in json.loads(crudo or "{}").get("items", []):
+        for item in items:
             if str(item.get("status", "")).casefold() == cfg.estado_hecho.casefold():
                 continue
             contenido = item.get("content") or {}
@@ -235,19 +304,38 @@ class Backend:
         return crudo.strip() or None
 
     async def crear(self, repo: str, titulo: str, fecha: str | None, cuerpo: str = "") -> None:
+        """Alta en dos o tres pasos que NO son atómicos.
+
+        No intentamos deshacer nada -borrar un issue recién creado es peor remedio-,
+        pero a partir del primer paso cumplido los fallos salen como `ErrorParcial`
+        para que la UI diga lo que de verdad quedó en GitHub.
+        """
         salida = await gh(
             "issue", "create", "--repo", repo, "--title", titulo, "--body", cuerpo,
         )
         url = salida.strip().splitlines()[-1]
-        item = (
-            await gh(
-                "project", "item-add", self.config.project,
-                "--owner", self.config.owner, "--url", url,
-                "--format", "json", "--jq", ".id",
-            )
-        ).strip()
-        if fecha:
+        try:
+            item = (
+                await gh(
+                    "project", "item-add", self.config.project,
+                    "--owner", self.config.owner, "--url", url,
+                    "--format", "json", "--jq", ".id",
+                )
+            ).strip()
+        except (ErrorGh, OSError) as err:
+            raise ErrorParcial(
+                f"the new issue exists on GitHub but wasn't added to the board "
+                f"— check {url} ({err})"
+            ) from err
+        if not fecha:
+            return
+        try:
             await self.fechar(item, fecha)
+        except (ErrorGh, OSError) as err:
+            raise ErrorParcial(
+                f"the new issue was created without a due date — set it by hand "
+                f"at {url} ({err})"
+            ) from err
 
     async def cerrar(self, tarea: Tarea) -> None:
         await gh("issue", "close", str(tarea.numero), "--repo", tarea.repo)
