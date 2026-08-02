@@ -16,7 +16,7 @@ def main() -> int:
         return 0
 
     if shutil.which("gh") is None:
-        print("tareas: necesita GitHub CLI (https://cli.github.com)", file=sys.stderr)
+        print("tareas: needs GitHub CLI (https://cli.github.com)", file=sys.stderr)
         return 2
 
     from .config import ErrorConfig, cargar

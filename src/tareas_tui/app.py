@@ -126,11 +126,11 @@ class AtajosFecha(Horizontal):
     """
 
     OPCIONES: tuple[tuple[str, str], ...] = (
-        ("hoy", "hoy"),
-        ("mañana", "manana"),
-        ("+3 días", "mas3"),
-        ("próx. sem.", "semana"),
-        ("+1 mes", "mes"),
+        ("today", "hoy"),
+        ("tomorrow", "manana"),
+        ("+3 days", "mas3"),
+        ("next week", "semana"),
+        ("+1 month", "mes"),
     )
 
     class Elegida(Message):
@@ -190,11 +190,11 @@ class DetalleScreen(DialogoModal):
                 id="det-meta",
             )
             with VerticalScroll(id="det-cuerpo"):
-                yield Markdown(self.tarea.cuerpo or "_(sin descripción)_")
+                yield Markdown(self.tarea.cuerpo or "_(no description)_")
             with Horizontal(classes="fila-botones"):
-                yield Button("cerrar tarea", id="det-cerrar", classes="chip peligro")
-                yield Button("cambiar fecha", id="det-fecha", classes="chip")
-                yield Button("volver", id="det-volver", classes="chip")
+                yield Button("close task", id="det-cerrar", classes="chip peligro")
+                yield Button("change date", id="det-fecha", classes="chip")
+                yield Button("back", id="det-volver", classes="chip")
 
     def on_mount(self) -> None:
         self.query_one("#det-cuerpo").focus()
@@ -214,17 +214,17 @@ class FechaScreen(DialogoModal):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dlg-fecha", classes="dlg"):
-            yield Static(f"vencimiento · {acortar(self.titulo, 120)}", classes="dlg-titulo")
+            yield Static(f"due date · {acortar(self.titulo, 120)}", classes="dlg-titulo")
             yield AtajosFecha(classes="fila-chips")
             with Horizontal(classes="fila-botones"):
                 yield Input(
                     value=self.actual.isoformat() if self.actual else "",
-                    placeholder="AAAA-MM-DD",
+                    placeholder="YYYY-MM-DD",
                     id="fecha-input",
                 )
-                yield Button("guardar", id="fecha-guardar", classes="chip")
-                yield Button("quitar", id="fecha-quitar", classes="chip")
-                yield Button("cancelar", id="fecha-cancelar", classes="chip")
+                yield Button("save", id="fecha-guardar", classes="chip")
+                yield Button("clear", id="fecha-quitar", classes="chip")
+                yield Button("cancel", id="fecha-cancelar", classes="chip")
             yield Static("", id="fecha-error", classes="error-linea")
 
     def on_mount(self) -> None:
@@ -257,7 +257,7 @@ class FechaScreen(DialogoModal):
         try:
             date.fromisoformat(texto)
         except ValueError:
-            self.query_one("#fecha-error", Static).update("formato inválido, usa AAAA-MM-DD")
+            self.query_one("#fecha-error", Static).update("invalid format, use YYYY-MM-DD")
             return
         self.dismiss(texto)
 
@@ -278,20 +278,20 @@ class NuevaScreen(DialogoModal):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dlg-nueva", classes="dlg"):
-            yield Static("nueva tarea", classes="dlg-titulo")
+            yield Static("new task", classes="dlg-titulo")
             if self.repo_prefijado is not None:
                 yield BotonCabecera(
                     f"repo: {self.repo_prefijado}", "cambiar-repo",
                     id="nueva-repo-fijo", classes="chip",
                 )
-            yield Input(placeholder="filtrar cliente/repo…", id="nueva-filtro")
+            yield Input(placeholder="filter repo…", id="nueva-filtro")
             yield OptionList(id="nueva-repos")
-            yield Input(placeholder="¿qué te pidieron?", id="nueva-titulo")
+            yield Input(placeholder="what did they ask for?", id="nueva-titulo")
             yield AtajosFecha(classes="fila-chips")
             with Horizontal(classes="fila-botones"):
-                yield Input(placeholder="AAAA-MM-DD (opcional)", id="nueva-fecha")
-                yield Button("crear", id="nueva-crear", classes="chip")
-                yield Button("cancelar", id="nueva-cancelar", classes="chip")
+                yield Input(placeholder="YYYY-MM-DD (optional)", id="nueva-fecha")
+                yield Button("create", id="nueva-crear", classes="chip")
+                yield Button("cancel", id="nueva-cancelar", classes="chip")
             yield Static("", id="nueva-error", classes="error-linea")
 
     def on_mount(self) -> None:
@@ -321,7 +321,7 @@ class NuevaScreen(DialogoModal):
         lista.clear_options()
         self.repo_elegido = None
         if not repos:
-            lista.add_option(Option("(sin repos que calcen)", disabled=True))
+            lista.add_option(Option("(no matching repos)", disabled=True))
             return
         lista.add_options([Option(r, id=r) for r in repos])
         lista.highlighted = 0
@@ -370,17 +370,17 @@ class NuevaScreen(DialogoModal):
         titulo = self.query_one("#nueva-titulo", Input).value.strip()
         fecha = self.query_one("#nueva-fecha", Input).value.strip()
         if not self.repo_elegido:
-            error.update("elige un cliente/repo de la lista")
+            error.update("choose a repo from the list")
             return
         if not titulo:
-            error.update("falta el título")
+            error.update("title is required")
             self.query_one("#nueva-titulo", Input).focus()
             return
         if fecha:
             try:
                 date.fromisoformat(fecha)
             except ValueError:
-                error.update("fecha inválida, usa AAAA-MM-DD")
+                error.update("invalid date, use YYYY-MM-DD")
                 return
         self.dismiss({"repo": self.repo_elegido, "titulo": titulo, "fecha": fecha})
 
@@ -396,8 +396,8 @@ class ConfirmaScreen(DialogoModal):
         with Vertical(id="dlg-confirma", classes="dlg"):
             yield Static(self.pregunta, classes="dlg-titulo")
             with Horizontal(classes="fila-botones"):
-                yield Button("sí, cerrar", id="ok", classes="chip peligro")
-                yield Button("cancelar", id="no", classes="chip")
+                yield Button("yes, close", id="ok", classes="chip peligro")
+                yield Button("cancel", id="no", classes="chip")
 
     def on_mount(self) -> None:
         self.query_one("#no", Button).focus()
@@ -414,13 +414,13 @@ class ListaScreen(Screen):
     BINDINGS = [
         # priority: DataTable también usa enter, y sin esto su binding (oculto) gana
         # el desempate y el footer se queda sin la pista más importante.
-        Binding("enter", "ver", "ver", priority=True),
-        Binding("n", "nueva", "nueva"),
-        Binding("d", "fecha", "fecha"),
-        Binding("x", "cerrar", "cerrar"),
-        Binding("r", "refrescar", "refrescar"),
+        Binding("enter", "ver", "view", priority=True),
+        Binding("n", "nueva", "new"),
+        Binding("d", "fecha", "date"),
+        Binding("x", "cerrar", "close"),
+        Binding("r", "refrescar", "refresh"),
         Binding("t", "toggle_repo", "repo"),
-        Binding("q", "salir", "salir"),
+        Binding("q", "salir", "quit"),
         Binding("j", "abajo", "", show=False),
         Binding("k", "arriba", "", show=False),
     ]
@@ -440,7 +440,7 @@ class ListaScreen(Screen):
         with Horizontal(id="cabecera"):
             yield Static("", id="cab-titulo")
             yield BotonCabecera("", "toggle_repo", id="cab-toggle", classes="cab-btn")
-            yield BotonCabecera("+ nueva", "nueva", id="cab-nueva", classes="cab-btn")
+            yield BotonCabecera("+ new", "nueva", id="cab-nueva", classes="cab-btn")
             yield BotonCabecera("⟳", "refrescar", id="cab-refrescar", classes="cab-btn")
         tabla: DataTable = DataTable(id="tabla")
         tabla.cursor_type = "row"
@@ -471,7 +471,7 @@ class ListaScreen(Screen):
             self.ultimo_error = None
         except Exception as err:  # noqa: BLE001 - cualquier fallo va a la UI, no al log
             self.ultimo_error = str(err)
-            self.notify(f"no pude leer el Project: {err}", severity="error", timeout=6)
+            self.notify(f"couldn't read the Project: {err}", severity="error", timeout=6)
         finally:
             self.cargando = False
             self._pintar_tabla()
@@ -552,46 +552,46 @@ class ListaScreen(Screen):
     def _pintar_vacio(self) -> None:
         widget = self.query_one("#vacio", Static)
         if self.cargando:
-            widget.update(Text("cargando tareas…", style="dim"))
+            widget.update(Text("loading tasks…", style="dim"))
         elif self.ultimo_error:
             widget.update(
                 Text.assemble(
-                    ("no pude leer el Project\n", "bold red"),
+                    ("couldn't read the Project\n", "bold red"),
                     (f"{acortar(self.ultimo_error, 120)}\n\n", "dim"),
-                    ("pulsa r o haz clic en ⟳ para reintentar", "dim"),
+                    ("press r or click ⟳ to retry", "dim"),
                 )
             )
         elif self.modo_repo and self.repo_actual:
             widget.update(
                 Text.assemble(
-                    (f"✓  sin pendientes en {acortar(self.repo_actual, 40)}\n\n", "bold green"),
-                    ("pulsa t o haz clic en «todas» para ver el resto", "dim"),
+                    (f"✓  nothing pending in {acortar(self.repo_actual, 40)}\n\n", "bold green"),
+                    ('press t or click "all" to see the rest', "dim"),
                 )
             )
         else:
             widget.update(
                 Text.assemble(
-                    ("✓  sin tareas pendientes\n\n", "bold green"),
-                    ("pulsa n o haz clic en «+ nueva» para agregar una", "dim"),
+                    ("✓  no pending tasks\n\n", "bold green"),
+                    ('press n or click "+ new" to add one', "dim"),
                 )
             )
 
     def _pintar_cabecera(self) -> None:
         cuantas = len(self.visibles)
         if self.cargando:
-            estado = "cargando…"
+            estado = "loading…"
         elif self.ultimo_error:
-            estado = "sin conexión"
+            estado = "no connection"
         elif cuantas == 0:
-            estado = "sin pendientes"
+            estado = "nothing pending"
         else:
-            estado = f"{cuantas} pendiente{'s' if cuantas != 1 else ''}"
+            estado = f"{cuantas} pending"
 
         if self.modo_repo and self.repo_actual:
             etiqueta_titulo = self.repo_actual
         else:
-            etiqueta_titulo = "tareas de clientes"
-        etiqueta_toggle = "todas" if self.modo_repo else "este repo"
+            etiqueta_titulo = self.backend.titulo_project
+        etiqueta_toggle = "all" if self.modo_repo else "this repo"
         toggle = self.query_one("#cab-toggle", BotonCabecera)
         toggle.display = self.repo_actual is not None
         toggle.update(Text(etiqueta_toggle))
@@ -620,7 +620,7 @@ class ListaScreen(Screen):
         if self.ultimo_ok is None:
             return "—"
         minutos = int((datetime.now() - self.ultimo_ok).total_seconds() // 60)
-        return "recién" if minutos < 1 else f"hace {minutos}m"
+        return "just now" if minutos < 1 else f"{minutos}m ago"
 
     def on_resize(self, event: events.Resize) -> None:
         self._pintar_cabecera()
@@ -689,7 +689,7 @@ class ListaScreen(Screen):
     async def action_fecha(self) -> None:
         tarea = self.seleccionada
         if tarea is None:
-            self.notify("no hay tarea seleccionada", severity="warning", timeout=3)
+            self.notify("no task selected", severity="warning", timeout=3)
             return
         await self._fechar(tarea)
 
@@ -697,7 +697,7 @@ class ListaScreen(Screen):
     async def action_cerrar(self) -> None:
         tarea = self.seleccionada
         if tarea is None:
-            self.notify("no hay tarea seleccionada", severity="warning", timeout=3)
+            self.notify("no task selected", severity="warning", timeout=3)
             return
         await self._cerrar(tarea)
 
@@ -712,9 +712,9 @@ class ListaScreen(Screen):
         try:
             await self.backend.crear(datos["repo"], datos["titulo"], datos["fecha"] or None)
         except (ErrorGh, IndexError, OSError) as err:
-            self.notify(f"no pude crear la tarea: {err}", severity="error", timeout=6)
+            self.notify(f"couldn't create the task: {err}", severity="error", timeout=6)
             return
-        self.notify("tarea creada", timeout=3)
+        self.notify("task created", timeout=3)
         self.refrescar()
 
     async def _fechar(self, tarea: Tarea) -> None:
@@ -724,21 +724,21 @@ class ListaScreen(Screen):
         try:
             await self.backend.fechar(tarea.item_id, nueva or None)
         except (ErrorGh, OSError) as err:
-            self.notify(f"no pude cambiar la fecha: {err}", severity="error", timeout=6)
+            self.notify(f"couldn't update the date: {err}", severity="error", timeout=6)
             return
-        self.notify("vencimiento actualizado" if nueva else "vencimiento quitado", timeout=3)
+        self.notify("due date updated" if nueva else "due date cleared", timeout=3)
         self.refrescar()
 
     async def _cerrar(self, tarea: Tarea) -> None:
-        pregunta = f"¿cerrar «{acortar(tarea.titulo, 60)}»?"
+        pregunta = f'close "{acortar(tarea.titulo, 60)}"?'
         if not await self.app.push_screen_wait(ConfirmaScreen(pregunta)):
             return
         try:
             await self.backend.cerrar(tarea)
         except (ErrorGh, OSError) as err:
-            self.notify(f"no pude cerrar la tarea: {err}", severity="error", timeout=6)
+            self.notify(f"couldn't close the task: {err}", severity="error", timeout=6)
             return
-        self.notify(f"cerrada {tarea.cliente}", timeout=3)
+        self.notify(f"closed {tarea.cliente}", timeout=3)
         self.refrescar()
 
 
@@ -746,7 +746,7 @@ class ListaScreen(Screen):
 # App
 # ------------------------------------------------------------------------------------
 class TareasApp(App):
-    TITLE = "tareas de clientes"
+    TITLE = "tasks"
     # En un pane chico cada columna del footer cuenta, y la paleta no aporta acá.
     ENABLE_COMMAND_PALETTE = False
 
