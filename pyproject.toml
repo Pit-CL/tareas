@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tareas-tui"
+version = "1.0.0"
+description = "TUI para llevar las tareas de clientes sobre un GitHub Project, pensada para vivir en un pane chico"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = ["textual==8.2.8"]
+keywords = ["tui", "textual", "github", "projects", "tareas"]
+classifiers = [
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/Pit-CL/tareas"
+
+[project.scripts]
+tareas-tui = "tareas_tui.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

@@ -1,0 +1,19 @@
+# Copia este archivo a ~/.config/tareas/config.toml y ajusta los valores.
+# La app resuelve sola los identificadores internos del Project y los cachea
+# en ~/.config/tareas/ids-cache.json, así que aquí no va nada opaco.
+
+# Usuario u organización dueña del GitHub Project (v2).
+owner = "mi-usuario"
+
+# Número del Project; es el que aparece al final de su URL.
+# https://github.com/users/mi-usuario/projects/1  ->  1
+project = 1
+
+# Nombre del campo de tipo Date que marca el vencimiento.
+campo_fecha = "Vencimiento"
+
+# Nombre de la opción de Status que cuenta como terminada.
+estado_hecho = "Done"
+
+# Cuerpo que se le pone al issue cuando lo creas desde la TUI.
+cuerpo_nuevo = "Creada desde la TUI de tareas."
