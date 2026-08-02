@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 
 from rich.style import Style
@@ -27,7 +28,7 @@ from textual.coordinate import Coordinate
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
-from textual.widgets import Button, DataTable, Footer, Input, Markdown, OptionList, Static
+from textual.widgets import Button, DataTable, Footer, Input, OptionList, Static
 from textual.widgets.data_table import CellDoesNotExist
 from textual.widgets.option_list import Option
 
@@ -46,6 +47,8 @@ from .datos import (
     etiqueta_vencimiento,
     fecha_larga,
     mas_un_mes,
+    ordenar,
+    parsear_fecha,
 )
 
 REFRESCO_SEGUNDOS = 300.0
@@ -302,6 +305,11 @@ class DetalleScreen(DialogoModal):
         self.tarea = tarea
 
     def compose(self) -> ComposeResult:
+        # `Markdown` se importa acá y no arriba porque arrastra markdown-it y pygments:
+        # 39 ms de los 245 que tarda en importarse la app, pagados en CADA arranque
+        # para un widget que solo aparece si el usuario abre un detalle.
+        from textual.widgets import Markdown
+
         with Vertical(id="dlg-detalle", classes="dlg"):
             yield Static(self.tarea.titulo, id="det-titulo")
             yield Static(self._meta(), id="det-meta")
@@ -724,6 +732,11 @@ class ListaScreen(Screen):
         # la siguiente ocurrencia de las repetitivas.
         self.ocupadas: dict[str, str] = {}
         self.limite_avisado = False
+        # item_ids cerrados en esta sesión que el Project todavía puede devolver como
+        # pendientes: el Status "Done" lo pone un workflow de Projects DESPUÉS de que
+        # `gh issue close` vuelve, así que el refresco inmediato llega a destiempo y
+        # resucitaría la fila que el usuario acaba de ver desaparecer.
+        self.cerradas: set[str] = set()
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="cabecera"):
@@ -744,6 +757,7 @@ class ListaScreen(Screen):
         tabla.add_column("↻", width=ANCHO_REPEAT, key="repeat")
         tabla.add_column("cliente", width=ANCHO_CLIENTE_MAX, key="cliente")
         tabla.add_column("título", width=40, key="titulo")
+        self._precargar()
         self._pintar_vacio()
         self._pintar_cabecera()
         self.refrescar()
@@ -752,11 +766,37 @@ class ListaScreen(Screen):
         self.set_interval(REFRESCO_SEGUNDOS, self.refrescar)
         self.set_interval(20.0, self._pintar_cabecera)
 
+    def _precargar(self) -> None:
+        """Pinta la última lectura guardada en disco antes de tocar la red.
+
+        Las tres llamadas a `gh` del arranque no vuelven antes de ~0,3 s y la lista
+        tardaba ~1,3 s en aparecer. Con el caché la pantalla nace poblada y el
+        refresco real la corrige por detrás; la antigüedad del dato no se disimula,
+        va en el `⟳ Xm ago` de la cabecera.
+        """
+        guardado = self.backend.instantanea()
+        if guardado.tareas is None:
+            return
+        self.tareas = guardado.tareas
+        self.ultimo_ok = guardado.momento
+        self.repos = guardado.repos
+        if guardado.repo_actual:
+            # Se aplica el filtro desde el primer frame: sin esto la lista se pintaba
+            # entera y saltaba al repo actual recién cuando volvía `gh repo view`.
+            self.repo_actual = guardado.repo_actual
+            self.modo_repo = True
+        self.cargando = False
+        self._pintar_tabla()
+
     # ------------------------------------------------------------------ datos
     @work(exclusive=True, group="listar")
     async def refrescar(self) -> None:
         try:
-            self.tareas = await self.backend.listar()
+            llegadas = await self.backend.listar()
+            # Se recuerdan solo las que el Project sigue devolviendo: en cuanto deja de
+            # mandarlas el filtro sobra y el set se vacía solo, sin caducidad inventada.
+            self.cerradas &= {t.item_id for t in llegadas}
+            self.tareas = [t for t in llegadas if t.item_id not in self.cerradas]
             self.ultimo_ok = datetime.now()
             self.ultimo_error = None
             self._avisar_limite()
@@ -820,7 +860,22 @@ class ListaScreen(Screen):
             return [t for t in self.tareas if t.repo == self.repo_actual]
         return self.tareas
 
+    @property
+    def _pintable(self) -> bool:
+        """False cuando la pantalla ya se está yendo y no queda nada que pintar.
+
+        Salir con una llamada a `gh` en vuelo cancela su worker, pero el `finally` de
+        `refrescar` (y el cierre de `detectar_repo`) igual intentan repintar. Para
+        entonces Textual ya sacó a los hijos aunque la Screen siga marcada como
+        montada, así que hay que preguntar por el widget y no por `is_mounted`: sin
+        esto reventaba con NoMatches, y `bin/tareas` lee esa caída como crash y
+        relanza la app en bucle.
+        """
+        return bool(self.query("#tabla"))
+
     def _pintar_tabla(self) -> None:
+        if not self._pintable:
+            return
         tabla = self.query_one("#tabla", TablaTareas)
         recordado = self._item_bajo_cursor(tabla)
         fila_recordada = tabla.cursor_row
@@ -932,6 +987,8 @@ class ListaScreen(Screen):
             )
 
     def _pintar_cabecera(self) -> None:
+        if not self._pintable:  # misma carrera que en `_pintar_tabla`
+            return
         visibles = self.visibles
         cuantas = len(visibles)
         hoy = date.today()
@@ -939,7 +996,9 @@ class ListaScreen(Screen):
 
         # Segmentos (texto, estilo) del contador: la parte "overdue" usa el mismo rojo
         # semántico que las filas vencidas, para que el header se lea de un vistazo.
-        if self.cargando:
+        # "loading…" solo mientras no haya NADA que mostrar: si la lista viene del
+        # caché se muestra su conteo real, y el `⟳ Xm ago` de al lado dice de cuándo es.
+        if self.cargando and not self.tareas:
             estado: list[tuple[str, str]] = [("loading…", "yellow")]
         elif self.ultimo_error:
             estado = [("no connection", "yellow")]
@@ -1041,6 +1100,9 @@ class ListaScreen(Screen):
             self.query_one("#tabla", TablaTareas).cursor_coordinate = Coordinate(ultima, 0)
 
     def action_refrescar(self) -> None:
+        # El refresco a mano es la vía de escape si una tarea se reabrió en GitHub
+        # después de cerrarla acá: deja de ocultarse y vuelve a la lista.
+        self.cerradas.clear()
         self.refrescar()
 
     def action_toggle_repo(self) -> None:
@@ -1088,7 +1150,7 @@ class ListaScreen(Screen):
         if not datos:
             return
         try:
-            await self.backend.crear(
+            creada = await self.backend.crear(
                 datos["repo"],
                 datos["titulo"],
                 datos["fecha"] or None,
@@ -1103,6 +1165,8 @@ class ListaScreen(Screen):
         except (ErrorGh, IndexError, OSError) as err:
             self.notify(f"couldn't create the task: {err}", severity="error", timeout=6)
             return
+        if creada is not None:
+            self._aplicar([*self.tareas, creada])
         self.notify("task created", timeout=3)
         self.refrescar()
 
@@ -1123,6 +1187,17 @@ class ListaScreen(Screen):
         self.ocupadas.pop(tarea.item_id, None)
         self._pintar_tabla()
 
+    def _aplicar(self, tareas: list[Tarea]) -> None:
+        """Deja la lista como quedó tras una escritura que `gh` YA confirmó.
+
+        Antes cada acción terminaba llamando a `refrescar()` y nada más: la fila
+        seguía mostrando el dato viejo (o la tarea cerrada seguía ahí) durante el
+        `gh project item-list` completo, ~1 s. El refresco se sigue disparando
+        igual -GitHub manda-, pero ya no se espera para mostrar lo obvio.
+        """
+        self.tareas = ordenar(tareas)
+        self._pintar_tabla()
+
     async def _fechar(self, tarea: Tarea) -> None:
         if self._ocupada(tarea):
             return
@@ -1137,6 +1212,12 @@ class ListaScreen(Screen):
             return
         finally:
             self._liberar(tarea)
+        self._aplicar(
+            [
+                replace(t, vence=parsear_fecha(nueva)) if t.item_id == tarea.item_id else t
+                for t in self.tareas
+            ]
+        )
         self.notify("due date updated" if nueva else "due date cleared", timeout=3)
         self.refrescar()
 
@@ -1159,6 +1240,8 @@ class ListaScreen(Screen):
         except (ErrorGh, OSError) as err:
             self.notify(f"couldn't close the task: {err}", severity="error", timeout=6)
             return
+        self.cerradas.add(tarea.item_id)
+        self._aplicar([t for t in self.tareas if t.item_id != tarea.item_id])
         self.notify(f"closed {tarea.cliente}", timeout=3)
         if tarea.repeat:
             await self._repetir(tarea)
@@ -1177,7 +1260,7 @@ class ListaScreen(Screen):
             )
             return
         try:
-            proxima = await self.backend.repetir(tarea, date.today())
+            siguiente = await self.backend.repetir(tarea, date.today())
         except ErrorParcial as err:
             # La ocurrencia ya nació, solo que incompleta: decir que no se creó llevaría
             # al usuario a crearla de nuevo y a duplicar la serie.
@@ -1190,7 +1273,8 @@ class ListaScreen(Screen):
                 timeout=8,
             )
             return
-        self.notify(f"↻ next: {proxima.isoformat()}", timeout=4)
+        self._aplicar([*self.tareas, siguiente])
+        self.notify(f"↻ next: {siguiente.vence.isoformat()}", timeout=4)
 
 
 # ------------------------------------------------------------------------------------

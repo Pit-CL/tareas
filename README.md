@@ -90,6 +90,13 @@ with `gh` on first run and caches them in `~/.config/tareas/ids-cache.json`. If 
 ever change the Project, delete that file and they get resolved again — that's
 also when the app picks up a renamed Project title (see below).
 
+Next to it, `~/.config/tareas/datos-cache.json` keeps the last good read (tasks,
+repo list, and which repo each directory belongs to) so the list is on screen from
+the first frame instead of after a round trip to GitHub. It refreshes in the
+background right away, and the `⟳ 3m ago` in the header always tells you how old
+what you're looking at is. The file is disposable: delete it and the next start
+just goes back to asking `gh` for everything.
+
 > **Removed in 1.1.0:** the `cuerpo_nuevo` key. New issues used to be created with
 > that fixed placeholder body; now the body is whatever you type in the *notes*
 > field of the new-task dialog, and empty by default. If the key is still in your
@@ -269,14 +276,18 @@ TAREAS_DEMO=1 .venv/bin/python -m tareas_tui     # sample data, no GitHub calls
 what's used for this README's screenshots. `BackendDemo(repo_actual="owner/repo")`
 also simulates contextual repo mode without touching GitHub.
 
-The code is three modules: `config.py` (configuration and ID resolution),
-`datos.py` (`gh` calls, date math and formatting), and `app.py` (the interface).
-Tests are split the same way: `tests/test_repeticion.py` covers the recurrence
-math on its own, `tests/test_backend.py` covers the `gh` layer (timeouts, orphaned
-subprocesses, partial writes, the item limit) against a fake `gh`, and
-`tests/test_app.py` drives the interface with textual's Pilot. The whole suite runs
-without the GitHub CLI installed and without credentials or network, which is what
-CI does on Python 3.11 and 3.12.
+The code is four modules: `config.py` (configuration and ID resolution),
+`datos.py` (`gh` calls, date math and formatting), `cache.py` (the on-disk copy of
+the last good read), and `app.py` (the interface). Tests are split the same way:
+`tests/test_repeticion.py` covers the recurrence math on its own,
+`tests/test_backend.py` covers the `gh` layer (timeouts, orphaned subprocesses,
+partial writes, the item limit) against a fake `gh`, `tests/test_cache.py` covers
+the disk cache (round trip, corrupt or stale files, and that the demo never touches
+it), and `tests/test_app.py` drives the interface with textual's Pilot. The whole
+suite runs without the GitHub CLI installed and without credentials or network,
+which is what CI does on Python 3.11 and 3.12 — and `tests/conftest.py` points
+`XDG_CONFIG_HOME` at a temporary directory so it never reads or writes the config
+of whoever runs it.
 
 > **Note:** the interface currently ships in English; the dates and data you'll
 > see when you run it come straight from your own GitHub Project.

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 from textual.coordinate import Coordinate
@@ -1198,3 +1198,274 @@ async def test_los_separadores_decorativos_siguen_en_dim():
         screen = await _listo(pilot)
         segmentos = _pintado(screen.query_one("#cab-titulo"))
         assert any(s.style.dim and not s.text.strip(" ·") for s in segmentos)
+
+
+# ------------------------------------------------------------------ arranque desde caché
+class BackendListarLento(BackendDemo):
+    """La primera lectura no vuelve hasta que se suelta el evento.
+
+    Es la ventana donde antes solo había «loading tasks…»: `gh project item-list`
+    tarda ~1 s y la pantalla no tenía nada que pintar hasta que contestaba.
+    """
+
+    def __init__(self, guardado: datos.Instantanea, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.suelta = asyncio.Event()
+        self._guardado = guardado
+
+    def instantanea(self) -> datos.Instantanea:
+        return self._guardado
+
+    async def listar(self):
+        await self.suelta.wait()
+        return await super().listar()
+
+
+def _cacheadas(cuantas: int) -> list[datos.Tarea]:
+    return [
+        datos.Tarea(
+            item_id=f"cache-{i}",
+            repo="acme/web",
+            numero=i,
+            titulo=f"Cached task {i}",
+            url=f"https://example.com/{i}",
+            cuerpo="",
+            vence=date.today() + timedelta(days=i),
+            repeat=None,
+        )
+        for i in range(cuantas)
+    ]
+
+
+async def test_la_lista_se_pinta_del_cache_antes_de_que_conteste_la_red():
+    guardado = datos.Instantanea(
+        tareas=_cacheadas(3), momento=datetime.now() - timedelta(minutes=4)
+    )
+    backend = BackendListarLento(guardado)
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = pilot.app.screen
+        await pilot.pause()
+
+        # la red sigue sin contestar y la lista YA está en pantalla
+        assert not backend.suelta.is_set()
+        assert screen.query_one("#tabla").row_count == 3
+        assert [t.item_id for t in screen.visibles] == ["cache-0", "cache-1", "cache-2"]
+        assert screen.query_one("#vacio").display is False
+
+        # el header dice cuántas hay y de cuándo son, en vez de "loading…"
+        cabecera = screen.query_one("#cab-titulo").content.plain
+        assert "3 pending" in cabecera
+        assert "loading" not in cabecera
+        assert "4m ago" in screen.query_one("#cab-refrescar").content.plain
+
+        # cuando por fin llega la red, manda ella
+        backend.suelta.set()
+        await _esperar(pilot, lambda: any(t.item_id.startswith("demo") for t in screen.tareas))
+        assert len(screen.visibles) == 7
+
+
+async def test_sin_cache_el_arranque_sigue_diciendo_loading():
+    backend = BackendListarLento(datos.Instantanea())
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = pilot.app.screen
+        await pilot.pause()
+        assert screen.cargando is True
+        assert "loading tasks…" in screen.query_one("#vacio").content.plain
+        assert "loading…" in screen.query_one("#cab-titulo").content.plain
+        backend.suelta.set()
+        await _esperar(pilot, lambda: not screen.cargando)
+
+
+async def test_el_cache_del_repo_actual_filtra_desde_el_primer_frame():
+    """Sin esto la lista se pintaba entera y saltaba al repo recién cuando volvía
+    `gh repo view` (~0,3 s): un parpadeo con la lista de otro alcance."""
+    guardado = datos.Instantanea(tareas=_cacheadas(3), repo_actual="acme/web")
+    backend = BackendListarLento(guardado, repo_actual="acme/web")
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = pilot.app.screen
+        await pilot.pause()
+        assert screen.modo_repo is True
+        assert screen.repo_actual == "acme/web"
+        assert screen.query_one("#cab-titulo").content.plain.startswith("acme/web")
+        backend.suelta.set()
+
+
+# ------------------------------------------------------------------ escrituras optimistas
+class BackendRefrescoColgado(BackendDemo):
+    """La primera lectura llega; el refresco que sigue a una escritura queda colgado.
+
+    Es justo el ~1 s en el que la fila mostraba el dato viejo: la escritura ya había
+    terminado, pero la UI esperaba al `item-list` completo para enterarse.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.lecturas = 0
+        self.suelta = asyncio.Event()
+
+    async def listar(self):
+        self.lecturas += 1
+        if self.lecturas > 1:
+            await self.suelta.wait()
+        return await super().listar()
+
+
+async def test_cerrar_saca_la_fila_sin_esperar_al_refresco():
+    backend = BackendRefrescoColgado()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        tarea = screen.seleccionada
+        assert tarea.repeat is None
+        cuantas = len(screen.tareas)
+
+        await pilot.press("x")
+        await pilot.pause()
+        await pilot.press("y")
+        await _esperar(pilot, lambda: all(t.item_id != tarea.item_id for t in screen.tareas))
+
+        assert backend.lecturas > 1  # el refresco se disparó…
+        assert not backend.suelta.is_set()  # …y sigue sin contestar
+        assert len(screen.tareas) == cuantas - 1
+        assert screen.query_one("#tabla").row_count == cuantas - 1
+        backend.suelta.set()
+
+
+async def test_la_fecha_nueva_se_ve_sin_esperar_al_refresco():
+    backend = BackendRefrescoColgado()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        await pilot.press("G")
+        tarea = screen.seleccionada
+        assert tarea.vence is None
+
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("3")  # 3 = "+3 days"
+        await _esperar(
+            pilot,
+            lambda: any(t.item_id == tarea.item_id and t.vence for t in screen.tareas),
+        )
+
+        assert backend.lecturas > 1 and not backend.suelta.is_set()
+        actualizada = next(t for t in screen.tareas if t.item_id == tarea.item_id)
+        assert actualizada.vence == date.today() + timedelta(days=3)
+        backend.suelta.set()
+
+
+async def test_la_tarea_nueva_aparece_sin_esperar_al_refresco():
+    backend = BackendRefrescoColgado(repo_actual="vela/landing")
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+
+        await pilot.press("n")
+        await pilot.pause()
+        pilot.app.screen.query_one("#nueva-titulo", Input).value = "Fresh one"
+        await pilot.press("ctrl+enter")
+        await _esperar(pilot, lambda: any(t.titulo == "Fresh one" for t in screen.tareas))
+
+        assert backend.lecturas > 1 and not backend.suelta.is_set()
+        creada = next(t for t in screen.tareas if t.titulo == "Fresh one")
+        assert creada.repo == "vela/landing"
+        backend.suelta.set()
+
+
+async def test_la_siguiente_ocurrencia_aparece_sin_esperar_al_refresco():
+    backend = BackendRefrescoColgado()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        await pilot.press("j")
+        tarea = screen.seleccionada
+        assert tarea.repeat == "monthly"
+
+        await pilot.press("x")
+        await pilot.pause()
+        await pilot.press("y")
+        await _esperar(
+            pilot,
+            lambda: any(
+                t.titulo == tarea.titulo and t.item_id != tarea.item_id for t in screen.tareas
+            ),
+        )
+
+        assert backend.lecturas > 1 and not backend.suelta.is_set()
+        siguiente = next(
+            t
+            for t in screen.tareas
+            if t.item_id != tarea.item_id and t.titulo == tarea.titulo
+        )
+        assert siguiente.vence == proxima_fecha(tarea.vence, "monthly", date.today())
+        assert len([t for t in screen.tareas if t.titulo == tarea.titulo]) == 1
+        backend.suelta.set()
+
+
+# ------------------------------------------------------------------ cierres que rebotan
+class BackendZombi(BackendDemo):
+    """`cerrar` funciona pero el Project sigue devolviendo la tarea como pendiente.
+
+    Es el comportamiento real de Projects: el Status "Done" lo pone un workflow que
+    corre DESPUÉS de que `gh issue close` volvió, así que el refresco inmediato llega
+    a destiempo y resucitaba la fila que el usuario acababa de ver desaparecer.
+    """
+
+    async def cerrar(self, tarea) -> None:
+        return None
+
+
+async def test_una_tarea_cerrada_no_revive_aunque_el_project_la_siga_mandando():
+    backend = BackendZombi()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        tarea = screen.seleccionada
+        assert tarea.repeat is None
+
+        await pilot.press("x")
+        await pilot.pause()
+        await pilot.press("y")
+        await _esperar(pilot, lambda: all(t.item_id != tarea.item_id for t in screen.tareas))
+
+        # el refresco ya trajo la lista completa, con la cerrada incluida…
+        await _esperar(pilot, lambda: screen.ultimo_ok is not None)
+        await pilot.pause()
+        assert tarea.item_id in screen.cerradas
+        assert all(t.item_id != tarea.item_id for t in screen.tareas)  # …y sigue oculta
+
+
+async def test_refrescar_a_mano_devuelve_una_tarea_reabierta_en_github():
+    """Vía de escape: si la tarea se reabrió afuera, `r` deja de esconderla."""
+    backend = BackendZombi()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        tarea = screen.seleccionada
+
+        await pilot.press("x")
+        await pilot.pause()
+        await pilot.press("y")
+        await _esperar(pilot, lambda: all(t.item_id != tarea.item_id for t in screen.tareas))
+
+        await pilot.press("r")
+        await _esperar(pilot, lambda: any(t.item_id == tarea.item_id for t in screen.tareas))
+        assert screen.cerradas == set()
+        assert any(t.item_id == tarea.item_id for t in screen.tareas)
+
+
+async def test_salir_con_una_lectura_en_vuelo_no_revienta():
+    """Salir mientras corre un `gh` cancela su worker, pero el `finally` de `refrescar`
+    seguía repintando: reventaba con NoMatches sobre la pantalla ya desmontada. Con el
+    caché la ventana se abrió de par en par (la app es usable mientras la red vuelve),
+    y `bin/tareas` interpreta esa caída como crash y relanza la app en bucle."""
+    backend = BackendListarLento(datos.Instantanea(tareas=_cacheadas(2)))
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        await pilot.pause()
+        assert not backend.suelta.is_set()  # la lectura sigue en vuelo al salir
+    # al cerrar el contexto, `run_test` relanza cualquier excepción de worker: que no
+    # haya excepción ES la prueba.
