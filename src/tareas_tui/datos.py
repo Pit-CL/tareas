@@ -142,6 +142,18 @@ class Backend:
         )
         return sorted(r["nameWithOwner"] for r in json.loads(crudo or "[]"))
 
+    async def repo_actual(self) -> str | None:
+        """Repo GitHub del directorio donde se lanzó la app, o None si no aplica.
+
+        Cubre estar fuera de un repo git, un repo sin remote de GitHub o sin `gh`
+        autenticado ahí: cualquier falla de `gh` cae en modo todas, en silencio.
+        """
+        try:
+            crudo = await gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
+        except ErrorGh:
+            return None
+        return crudo.strip() or None
+
     async def crear(self, repo: str, titulo: str, fecha: str | None) -> None:
         salida = await gh(
             "issue", "create", "--repo", repo, "--title", titulo,
@@ -203,8 +215,10 @@ _DEMO = (
 class BackendDemo(Backend):
     """Datos ficticios: alimenta las capturas del README y las pruebas."""
 
-    def __init__(self) -> None:  # noqa: D107 - no necesita Config
+    def __init__(self, repo_actual: str | None = None) -> None:
+        """`repo_actual` simula estar parado en ese repo (modo repo en la demo)."""
         hoy = date.today()
+        self._repo_actual = repo_actual
         self._tareas = ordenar(
             [
                 Tarea(
@@ -225,6 +239,9 @@ class BackendDemo(Backend):
 
     async def repos(self) -> list[str]:
         return ["acme/web", "korta/api", "lumen/tienda", "mesa/intranet", "vela/landing"]
+
+    async def repo_actual(self) -> str | None:
+        return self._repo_actual
 
     async def crear(self, repo: str, titulo: str, fecha: str | None) -> None:
         numero = max((t.numero for t in self._tareas), default=0) + 1
@@ -255,8 +272,8 @@ class BackendDemo(Backend):
         )
 
 
-def vacio_demo() -> BackendDemo:
-    """Demo sin tareas, para retratar el estado vacío."""
-    backend = BackendDemo()
+def vacio_demo(repo_actual: str | None = None) -> BackendDemo:
+    """Demo sin tareas, para retratar el estado vacío (también en modo repo)."""
+    backend = BackendDemo(repo_actual=repo_actual)
     backend._tareas = []
     return backend
