@@ -3,6 +3,10 @@
 Todas las llamadas usan `asyncio.create_subprocess_exec`, así que la UI nunca se
 congela esperando a la red. `BackendDemo` sirve datos ficticios para las capturas
 del README y para las pruebas, sin tocar GitHub.
+
+Cada lectura buena se copia a disco (ver `cache.py`) para que el próximo arranque
+pinte la lista sin esperar a la red. `BackendDemo` no cachea nada: la demo y la
+suite tienen que ser siempre reproducibles.
 """
 
 from __future__ import annotations
@@ -11,13 +15,15 @@ import asyncio
 import calendar
 import contextlib
 import json
+import os
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 
 from rich.color import Color as ColorRich
 from rich.style import Style
 
+from . import cache
 from .config import Config
 
 ANCHO_VENCE = 9  # "hace 120d" es el string más largo que generamos
@@ -239,6 +245,81 @@ def acortar(texto: str, ancho: int) -> str:
     return texto if len(texto) <= ancho else texto[: max(1, ancho - 1)] + "…"
 
 
+# ------------------------------------------------------------------ caché en disco
+@dataclass(frozen=True)
+class Instantanea:
+    """Lo último que llegó de GitHub, leído del disco al arrancar.
+
+    `tareas` en None significa «nunca hubo una lectura buena»: la pantalla arranca
+    entonces en «loading tasks…» como siempre. Una lista vacía es un dato legítimo
+    (el Project no tenía pendientes) y se pinta como tal.
+    """
+
+    tareas: list[Tarea] | None = None
+    momento: datetime | None = None
+    repos: list[str] = field(default_factory=list)
+    repo_actual: str | None = None
+
+
+def _tarea_a_dict(tarea: Tarea) -> dict:
+    return {
+        "item_id": tarea.item_id,
+        "repo": tarea.repo,
+        "numero": tarea.numero,
+        "titulo": tarea.titulo,
+        "url": tarea.url,
+        "cuerpo": tarea.cuerpo,
+        "vence": tarea.vence.isoformat() if tarea.vence else None,
+        "repeat": tarea.repeat,
+    }
+
+
+def _tarea_de_dict(crudo: object) -> Tarea | None:
+    """Devuelve None ante cualquier entrada rara: el caché no puede tumbar la app."""
+    if not isinstance(crudo, dict):
+        return None
+    try:
+        return Tarea(
+            item_id=str(crudo["item_id"]),
+            repo=str(crudo["repo"]),
+            numero=int(crudo["numero"]),
+            titulo=str(crudo["titulo"]),
+            url=str(crudo.get("url", "")),
+            cuerpo=str(crudo.get("cuerpo", "")),
+            vence=parsear_fecha(crudo.get("vence")),
+            repeat=str(crudo["repeat"]) if crudo.get("repeat") else None,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _momento_de(crudo: object) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(crudo))
+    except (TypeError, ValueError):
+        return None
+
+
+def _cwd() -> str:
+    """Directorio actual, o "" si ya no existe.
+
+    La app está pensada para vivir en un pane de larga vida (ver README): renombrar
+    o borrar el directorio desde el que se lanzó deja a `os.getcwd()` levantando
+    OSError, y esto corre en el arranque. Sin repo detectado se cae en modo todas,
+    que es exactamente lo que ya pasaba cuando `gh repo view` fallaba.
+    """
+    try:
+        return os.getcwd()
+    except OSError:
+        return ""
+
+
+def numero_de_url(url: str) -> int:
+    """Número del issue a partir de su URL; 0 si la URL no termina en un número."""
+    cola = url.rstrip("/").rsplit("/", 1)[-1]
+    return int(cola) if cola.isdigit() else 0
+
+
 # ------------------------------------------------------------------ backends
 class Backend:
     """Lee y escribe el Project real con `gh`."""
@@ -252,6 +333,36 @@ class Backend:
     @property
     def titulo_project(self) -> str:
         return self.config.project_title
+
+    # -------------------------------------------------------------- caché
+    @property
+    def _clave_cache(self) -> str:
+        """Una entrada por Project: cambiar de board no debe mostrar el anterior."""
+        return f"{self.config.owner}/{self.config.project}"
+
+    def _cachear(self, **campos) -> None:
+        cache.escribir(self._clave_cache, campos)
+
+    def instantanea(self) -> Instantanea:
+        """Última lectura buena guardada en disco, para pintar antes de la red."""
+        guardado = cache.leer(self._clave_cache)
+        crudas = guardado.get("tareas")
+        tareas: list[Tarea] | None = None
+        if isinstance(crudas, list):
+            tareas = [t for t in map(_tarea_de_dict, crudas) if t is not None]
+        repos = guardado.get("repos")
+        # El repo del cwd se cachea por directorio: la app se lanza desde muchos.
+        repos_cwd = guardado.get("repo_actual")
+        repo_actual = None
+        if isinstance(repos_cwd, dict) and _cwd():
+            valor = repos_cwd.get(_cwd())
+            repo_actual = str(valor) if valor else None
+        return Instantanea(
+            tareas=tareas,
+            momento=_momento_de(guardado.get("momento")),
+            repos=[str(r) for r in repos] if isinstance(repos, list) else [],
+            repo_actual=repo_actual,
+        )
 
     async def listar(self) -> list[Tarea]:
         cfg = self.config
@@ -283,13 +394,20 @@ class Backend:
                     repeat=repeat,
                 )
             )
-        return ordenar(tareas)
+        ordenadas = ordenar(tareas)
+        self._cachear(
+            tareas=[_tarea_a_dict(t) for t in ordenadas],
+            momento=datetime.now().isoformat(timespec="seconds"),
+        )
+        return ordenadas
 
     async def repos(self) -> list[str]:
         crudo = await gh(
             "repo", "list", self.config.owner, "--limit", "200", "--json", "nameWithOwner"
         )
-        return sorted(r["nameWithOwner"] for r in json.loads(crudo or "[]"))
+        listado = sorted(r["nameWithOwner"] for r in json.loads(crudo or "[]"))
+        self._cachear(repos=listado)
+        return listado
 
     async def repo_actual(self) -> str | None:
         """Repo GitHub del directorio donde se lanzó la app, o None si no aplica.
@@ -301,14 +419,26 @@ class Backend:
             crudo = await gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
         except ErrorGh:
             return None
-        return crudo.strip() or None
+        repo = crudo.strip() or None
+        if repo and _cwd():
+            # Solo se cachea el caso positivo: estando fuera de un repo no hay filtro
+            # que aplicar, así que el arranque no gana nada recordándolo.
+            guardado = cache.leer(self._clave_cache).get("repo_actual")
+            por_cwd = dict(guardado) if isinstance(guardado, dict) else {}
+            por_cwd[_cwd()] = repo
+            self._cachear(repo_actual=por_cwd)
+        return repo
 
-    async def crear(self, repo: str, titulo: str, fecha: str | None, cuerpo: str = "") -> None:
+    async def crear(self, repo: str, titulo: str, fecha: str | None, cuerpo: str = "") -> Tarea:
         """Alta en dos o tres pasos que NO son atómicos.
 
         No intentamos deshacer nada -borrar un issue recién creado es peor remedio-,
         pero a partir del primer paso cumplido los fallos salen como `ErrorParcial`
         para que la UI diga lo que de verdad quedó en GitHub.
+
+        Devuelve la tarea creada para que la lista la muestre en el acto: releerla del
+        Project costaba otro `gh project item-list` entero (~1 s) sobre un alta que ya
+        gastó tres llamadas.
         """
         salida = await gh(
             "issue", "create", "--repo", repo, "--title", titulo, "--body", cuerpo,
@@ -327,8 +457,19 @@ class Backend:
                 f"the new issue exists on GitHub but wasn't added to the board "
                 f"— check {url} ({err})"
             ) from err
+        notas, repeat = separar_repeticion(cuerpo)
+        creada = Tarea(
+            item_id=item,
+            repo=repo,
+            numero=numero_de_url(url),
+            titulo=titulo,
+            url=url,
+            cuerpo=notas,
+            vence=parsear_fecha(fecha),
+            repeat=repeat,
+        )
         if not fecha:
-            return
+            return creada
         try:
             await self.fechar(item, fecha)
         except (ErrorGh, OSError) as err:
@@ -336,20 +477,20 @@ class Backend:
                 f"the new issue was created without a due date — set it by hand "
                 f"at {url} ({err})"
             ) from err
+        return creada
 
     async def cerrar(self, tarea: Tarea) -> None:
         await gh("issue", "close", str(tarea.numero), "--repo", tarea.repo)
 
-    async def repetir(self, tarea: Tarea, hoy: date) -> date:
-        """Crea la siguiente ocurrencia de una tarea repetitiva; devuelve su fecha."""
+    async def repetir(self, tarea: Tarea, hoy: date) -> Tarea:
+        """Crea la siguiente ocurrencia de una repetitiva; devuelve la tarea nueva."""
         if not tarea.repeat or tarea.vence is None:
             raise ValueError("the task doesn't repeat or has no due date")
         proxima = proxima_fecha(tarea.vence, tarea.repeat, hoy)
-        await self.crear(
+        return await self.crear(
             tarea.repo, tarea.titulo, proxima.isoformat(),
             componer_cuerpo(tarea.cuerpo, tarea.repeat),
         )
-        return proxima
 
     async def fechar(self, item_id: str, fecha: str | None) -> None:
         """`fecha` vacía o None limpia el vencimiento."""
@@ -418,6 +559,13 @@ class BackendDemo(Backend):
     def titulo_project(self) -> str:
         return self._project_title
 
+    def instantanea(self) -> Instantanea:
+        """La demo nunca lee ni escribe el caché del usuario: siempre arranca limpia."""
+        return Instantanea()
+
+    def _cachear(self, **campos) -> None:
+        return None
+
     async def listar(self) -> list[Tarea]:
         return list(self._tareas)
 
@@ -427,26 +575,23 @@ class BackendDemo(Backend):
     async def repo_actual(self) -> str | None:
         return self._repo_actual
 
-    async def crear(self, repo: str, titulo: str, fecha: str | None, cuerpo: str = "") -> None:
+    async def crear(self, repo: str, titulo: str, fecha: str | None, cuerpo: str = "") -> Tarea:
         # Igual que el backend real: el cuerpo entra crudo y la repetición se vuelve a
         # leer de ahí, así la demo ejercita el mismo ida y vuelta del metadato.
         notas, repeat = separar_repeticion(cuerpo)
         numero = max((t.numero for t in self._tareas), default=0) + 1
-        self._tareas = ordenar(
-            [
-                *self._tareas,
-                Tarea(
-                    item_id=f"demo-{numero}",
-                    repo=repo,
-                    numero=numero,
-                    titulo=titulo,
-                    url=f"https://example.com/{repo}/issues/{numero}",
-                    cuerpo=notas,
-                    vence=parsear_fecha(fecha),
-                    repeat=repeat,
-                ),
-            ]
+        creada = Tarea(
+            item_id=f"demo-{numero}",
+            repo=repo,
+            numero=numero,
+            titulo=titulo,
+            url=f"https://example.com/{repo}/issues/{numero}",
+            cuerpo=notas,
+            vence=parsear_fecha(fecha),
+            repeat=repeat,
         )
+        self._tareas = ordenar([*self._tareas, creada])
+        return creada
 
     async def cerrar(self, tarea: Tarea) -> None:
         self._tareas = [t for t in self._tareas if t.item_id != tarea.item_id]

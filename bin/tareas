@@ -38,9 +38,32 @@ if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) e
 fi
 
 # ---- venv ----------------------------------------------------------------------------
+# La comprobación se hace mirando el dist-info que deja pip, no importando textual:
+# ese `python -c 'import textual'` costaba ~0,15 s en CADA arranque (un intérprete
+# entero, más rich y el árbol de textual, solo para leer __version__).
+#
+# El atajo solo vale si el venv tiene UNA sola lib/pythonX.Y: cuando el python del
+# sistema sube de versión, el venv queda con la carpeta vieja (con su textual
+# instalado) más la nueva vacía, y el intérprete ya usa la nueva. Ahí el dist-info
+# viejo mentiría «ya está instalado», el import fallaría y `bin/tareas` relanzaría
+# la app en bucle -justo la recuperación automática que el probe por import daba
+# gratis-. Con dos carpetas (o ninguna) se cae al import, que es la respuesta
+# autorizada; el caso normal es una sola y no lanza ningún proceso.
 instalado=""
 if [ -x "$VENV/bin/python" ]; then
-  instalado=$("$VENV/bin/python" -c 'import textual; print(textual.__version__)' 2>/dev/null) || instalado=""
+  _libs=""
+  _cuantas=0
+  for _lib in "$VENV"/lib/python*/site-packages; do
+    if [ -d "$_lib" ]; then
+      _libs="$_lib"
+      _cuantas=$((_cuantas + 1))
+    fi
+  done
+  if [ "$_cuantas" -eq 1 ] && [ -d "$_libs/textual-$VERSION_TEXTUAL.dist-info" ]; then
+    instalado="$VERSION_TEXTUAL"
+  else
+    instalado=$("$VENV/bin/python" -c 'import textual; print(textual.__version__)' 2>/dev/null) || instalado=""
+  fi
 fi
 
 if [ "$instalado" != "$VERSION_TEXTUAL" ]; then
