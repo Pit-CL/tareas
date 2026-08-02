@@ -224,9 +224,9 @@ class DetalleScreen(DialogoModal):
             with VerticalScroll(id="det-cuerpo"):
                 yield Markdown(self.tarea.cuerpo or "_(no description)_")
             with Horizontal(classes="fila-botones"):
-                yield Button("close task", id="det-cerrar", classes="chip peligro")
-                yield Button("change date", id="det-fecha", classes="chip")
-                yield Button("back", id="det-volver", classes="chip")
+                yield Button("\\[close task]", id="det-cerrar", classes="chip peligro")
+                yield Button("\\[change date]", id="det-fecha", classes="chip")
+                yield Button("\\[back]", id="det-volver", classes="chip secundario")
             yield Static("j/k scroll · esc back", id="det-hint", classes="hint")
 
     def on_mount(self) -> None:
@@ -266,9 +266,9 @@ class FechaScreen(DialogoModal):
                     placeholder="YYYY-MM-DD",
                     id="fecha-input",
                 )
-                yield Button("save", id="fecha-guardar", classes="chip")
-                yield Button("clear", id="fecha-quitar", classes="chip")
-                yield Button("cancel", id="fecha-cancelar", classes="chip")
+                yield Button("\\[save]", id="fecha-guardar", classes="chip primario")
+                yield Button("\\[clear]", id="fecha-quitar", classes="chip peligro")
+                yield Button("\\[cancel]", id="fecha-cancelar", classes="chip secundario")
             yield Static("", id="fecha-error", classes="error-linea")
             yield Static("1-5 quick · enter save · esc cancel", id="fecha-hint", classes="hint")
 
@@ -306,7 +306,9 @@ class FechaScreen(DialogoModal):
         try:
             date.fromisoformat(texto)
         except ValueError:
-            self.query_one("#fecha-error", Static).update("invalid format, use YYYY-MM-DD")
+            error = self.query_one("#fecha-error", Static)
+            error.update("invalid format, use YYYY-MM-DD")
+            error.display = True
             return
         self.dismiss(texto)
 
@@ -335,7 +337,7 @@ class NuevaScreen(DialogoModal):
             yield Static("new task", classes="dlg-titulo")
             if self.repo_prefijado is not None:
                 yield BotonCabecera(
-                    f"repo: {self.repo_prefijado}", "cambiar-repo",
+                    f"\\[repo: {self.repo_prefijado}]", "cambiar-repo",
                     id="nueva-repo-fijo", classes="chip",
                 )
             yield Input(placeholder="filter repo…", id="nueva-filtro")
@@ -344,8 +346,8 @@ class NuevaScreen(DialogoModal):
             yield AtajosFecha(classes="fila-chips")
             with Horizontal(classes="fila-botones"):
                 yield InputFecha(placeholder="YYYY-MM-DD (optional)", id="nueva-fecha")
-                yield Button("create", id="nueva-crear", classes="chip")
-                yield Button("cancel", id="nueva-cancelar", classes="chip")
+                yield Button("\\[create]", id="nueva-crear", classes="chip primario")
+                yield Button("\\[cancel]", id="nueva-cancelar", classes="chip secundario")
             yield Static("", id="nueva-error", classes="error-linea")
             yield Static(
                 "1-5 quick date · enter next/create · esc cancel",
@@ -438,12 +440,14 @@ class NuevaScreen(DialogoModal):
         fecha = self.query_one("#nueva-fecha", Input).value.strip()
         if not self.repo_elegido:
             error.update("choose a repo from the list")
+            error.display = True
             filtro = self.query_one("#nueva-filtro", Input)
             if filtro.display:
                 filtro.focus()
             return
         if not titulo:
             error.update("title is required")
+            error.display = True
             self.query_one("#nueva-titulo", Input).focus()
             return
         if fecha:
@@ -451,6 +455,7 @@ class NuevaScreen(DialogoModal):
                 date.fromisoformat(fecha)
             except ValueError:
                 error.update("invalid date, use YYYY-MM-DD")
+                error.display = True
                 self.query_one("#nueva-fecha", Input).focus()
                 return
         self.dismiss({"repo": self.repo_elegido, "titulo": titulo, "fecha": fecha})
@@ -472,8 +477,8 @@ class ConfirmaScreen(DialogoModal):
         with Vertical(id="dlg-confirma", classes="dlg"):
             yield Static(self.pregunta, classes="dlg-titulo")
             with Horizontal(classes="fila-botones"):
-                yield Button("yes, close", id="ok", classes="chip peligro")
-                yield Button("cancel", id="no", classes="chip")
+                yield Button("\\[yes, close]", id="ok", classes="chip peligro")
+                yield Button("\\[cancel]", id="no", classes="chip secundario")
             yield Static("y close · n cancel", id="confirma-hint", classes="hint")
 
     def on_mount(self) -> None:
@@ -881,22 +886,26 @@ class TareasApp(App):
     .dlg-titulo { height: 1; color: $accent; text-style: bold; }
     .fila-chips { height: 1; width: 100%; }
     .fila-botones { height: 1; width: 100%; }
-    .error-linea { height: auto; color: $error; }
+    .error-linea { height: auto; color: $error; display: none; }
     .hint { height: 1; width: 100%; color: $foreground; text-style: dim; }
 
-    /* Botones de una fila: clickeables sin engordar la UI. */
-    /* El fondo va literal (color 8) y no por variable: las variables propias del theme
-       todavía no existen cuando se parsea App.CSS. Sobre el panel del modal (color 0)
-       queda un escalón visible, así que los botones se leen como botones. */
+    /* Botones de una fila: clickeables sin engordar la UI.
+       El color va literal (ansi_yellow/ansi_red/ansi_default) y no por variable: las
+       variables propias del theme todavía no existen cuando se parsea App.CSS. Sin
+       relleno gris: texto en acento sobre el fondo default, delimitado por los
+       corchetes del propio label (el borde de Button no cabe en height:1). En foco/
+       hover, "reverse" invierte fg/bg del par ya elegido -mismo truco que fzf/
+       lazygit-, así el contraste queda garantizado por construcción en cualquier
+       paleta ANSI decente. */
     .chip {
         height: 1; min-width: 0; width: auto; border: none;
-        padding: 0 1; margin: 0 1 0 0; background: ansi_bright_black; color: $foreground;
+        padding: 0 1; margin: 0 1 0 0; background: ansi_default; color: ansi_yellow;
         text-style: none;
     }
-    .chip:hover { background: $accent; color: $background; text-style: bold; }
-    .chip:focus { text-style: bold reverse; }
-    .peligro { color: $error; }
-    .peligro:hover { background: $error; color: $background; }
+    .chip:hover, .chip:focus { text-style: bold reverse; }
+    .primario { text-style: bold; }
+    .peligro { color: ansi_red; }
+    .secundario { color: ansi_default; text-style: dim; }
 
     #dlg-detalle { height: 90%; }
     #det-titulo { height: auto; max-height: 2; text-style: bold; }
@@ -909,8 +918,14 @@ class TareasApp(App):
     #nueva-repos {
         height: auto; max-height: 6; border: none; background: $background;
     }
+    /* border-left literal (marcador de "esto es un input"): a diferencia de
+       border-bottom, no consume una fila extra con height:1 (verificado). */
     #nueva-filtro, #nueva-titulo, #nueva-fecha, #fecha-input {
-        height: 1; border: none; padding: 0 1; background: $background; width: 1fr;
+        height: 1; border: none; border-left: solid ansi_default; padding: 0 1;
+        background: $background; width: 1fr;
+    }
+    #nueva-filtro:focus, #nueva-titulo:focus, #nueva-fecha:focus, #fecha-input:focus {
+        border-left: solid ansi_yellow;
     }
     #nueva-fecha, #fecha-input { max-width: 24; }
     """
