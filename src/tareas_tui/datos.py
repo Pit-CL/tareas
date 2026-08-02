@@ -10,12 +10,25 @@ from __future__ import annotations
 import asyncio
 import calendar
 import json
+import re
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 
 from .config import Config
 
 ANCHO_VENCE = 9  # "hace 120d" es el string más largo que generamos
+ANCHO_REPEAT = 1  # la marca ↻ de las tareas repetitivas
+
+# Intervalos de repetición, en el orden en que los cicla el chip del modal.
+REPETICIONES: tuple[str, ...] = ("none", "daily", "weekly", "biweekly", "monthly")
+
+# La repetición viaja en el propio cuerpo del issue como comentario HTML: GitHub no
+# lo muestra al renderizar el markdown, así que el usuario ve solo sus notas y no
+# hace falta ningún campo extra en el Project.
+MARCA_REPEAT = "<!-- tareas:repeat={} -->"
+_RE_MARCA = re.compile(r"[ \t]*<!--\s*tareas:repeat=([a-zA-Z]+)\s*-->[ \t]*\n?")
+
+_PASOS_DIAS = {"daily": 1, "weekly": 7, "biweekly": 14}
 
 
 class ErrorGh(Exception):
@@ -40,8 +53,9 @@ class Tarea:
     numero: int
     titulo: str
     url: str
-    cuerpo: str
+    cuerpo: str  # notas visibles, ya sin el metadato de repetición
     vence: date | None
+    repeat: str | None = None  # None, o uno de REPETICIONES distinto de "none"
 
     @property
     def cliente(self) -> str:
@@ -57,6 +71,71 @@ def parsear_fecha(valor: str | None) -> date | None:
         return date.fromisoformat(str(valor)[:10])
     except ValueError:
         return None
+
+
+# ------------------------------------------------------------------ repetición
+def separar_repeticion(cuerpo: str | None) -> tuple[str, str | None]:
+    """Parte el cuerpo del issue en (notas visibles, intervalo de repetición)."""
+    texto = cuerpo or ""
+    encontrado = _RE_MARCA.search(texto)
+    repeat: str | None = None
+    if encontrado:
+        valor = encontrado.group(1).casefold()
+        if valor in REPETICIONES and valor != "none":
+            repeat = valor
+    return _RE_MARCA.sub("", texto).strip(), repeat
+
+
+def componer_cuerpo(notas: str | None, repeat: str | None) -> str:
+    """Cuerpo del issue: las notas del usuario más el metadato invisible si repite."""
+    limpio = (notas or "").strip()
+    if not repeat or repeat == "none":
+        return limpio
+    marca = MARCA_REPEAT.format(repeat)
+    return f"{limpio}\n\n{marca}" if limpio else marca
+
+
+def mas_meses(d: date, meses: int) -> date:
+    """`meses` meses calendario después de `d`, recortando al último día del mes."""
+    total = d.month - 1 + meses
+    ano, mes = d.year + total // 12, total % 12 + 1
+    return date(ano, mes, min(d.day, calendar.monthrange(ano, mes)[1]))
+
+
+def mas_un_mes(d: date) -> date:
+    return mas_meses(d, 1)
+
+
+def avanzar(base: date, repeat: str, veces: int) -> date:
+    """`veces` intervalos después de `base`.
+
+    Monthly cuenta siempre desde el día original, nunca desde el ya recortado: así
+    31-ene + 2 meses da 31-mar y no 28-mar.
+    """
+    if repeat == "monthly":
+        return mas_meses(base, veces)
+    paso = _PASOS_DIAS.get(repeat)
+    if paso is None:
+        raise ValueError(f"unknown repeat interval: {repeat!r}")
+    return base + timedelta(days=paso * veces)
+
+
+def proxima_fecha(base: date, repeat: str, hoy: date) -> date:
+    """Siguiente vencimiento después de `base`, siempre posterior a `hoy`.
+
+    El catch-up importa cuando la tarea se cierra tarde: una semanal vencida hace un
+    mes no debe reaparecer ya vencida, sino en su próxima ocurrencia futura. El salto
+    se estima de una vez (no día a día) y el bucle solo ajusta el borde.
+    """
+    if repeat == "monthly":
+        veces = max(1, (hoy.year - base.year) * 12 + hoy.month - base.month)
+    elif repeat in _PASOS_DIAS:
+        veces = max(1, (hoy - base).days // _PASOS_DIAS[repeat])
+    else:
+        raise ValueError(f"unknown repeat interval: {repeat!r}")
+    while avanzar(base, repeat, veces) <= hoy:
+        veces += 1
+    return avanzar(base, repeat, veces)
 
 
 # ------------------------------------------------------------------ format (en)
@@ -98,11 +177,6 @@ def acortar(texto: str, ancho: int) -> str:
     return texto if len(texto) <= ancho else texto[: max(1, ancho - 1)] + "…"
 
 
-def mas_un_mes(d: date) -> date:
-    ano, mes = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
-    return date(ano, mes, min(d.day, calendar.monthrange(ano, mes)[1]))
-
-
 # ------------------------------------------------------------------ backends
 class Backend:
     """Lee y escribe el Project real con `gh`."""
@@ -127,6 +201,7 @@ class Backend:
             contenido = item.get("content") or {}
             if contenido.get("type") != "Issue":
                 continue
+            cuerpo, repeat = separar_repeticion(contenido.get("body"))
             tareas.append(
                 Tarea(
                     item_id=item.get("id", ""),
@@ -134,8 +209,9 @@ class Backend:
                     numero=int(contenido.get("number", 0)),
                     titulo=(contenido.get("title") or item.get("title") or "(untitled)").strip(),
                     url=contenido.get("url", ""),
-                    cuerpo=(contenido.get("body") or "").strip(),
+                    cuerpo=cuerpo,
                     vence=parsear_fecha(valor_campo(item, cfg.campo_fecha)),
+                    repeat=repeat,
                 )
             )
         return ordenar(tareas)
@@ -158,10 +234,9 @@ class Backend:
             return None
         return crudo.strip() or None
 
-    async def crear(self, repo: str, titulo: str, fecha: str | None) -> None:
+    async def crear(self, repo: str, titulo: str, fecha: str | None, cuerpo: str = "") -> None:
         salida = await gh(
-            "issue", "create", "--repo", repo, "--title", titulo,
-            "--body", self.config.cuerpo_nuevo,
+            "issue", "create", "--repo", repo, "--title", titulo, "--body", cuerpo,
         )
         url = salida.strip().splitlines()[-1]
         item = (
@@ -176,6 +251,17 @@ class Backend:
 
     async def cerrar(self, tarea: Tarea) -> None:
         await gh("issue", "close", str(tarea.numero), "--repo", tarea.repo)
+
+    async def repetir(self, tarea: Tarea, hoy: date) -> date:
+        """Crea la siguiente ocurrencia de una tarea repetitiva; devuelve su fecha."""
+        if not tarea.repeat or tarea.vence is None:
+            raise ValueError("the task doesn't repeat or has no due date")
+        proxima = proxima_fecha(tarea.vence, tarea.repeat, hoy)
+        await self.crear(
+            tarea.repo, tarea.titulo, proxima.isoformat(),
+            componer_cuerpo(tarea.cuerpo, tarea.repeat),
+        )
+        return proxima
 
     async def fechar(self, item_id: str, fecha: str | None) -> None:
         """`fecha` vacía o None limpia el vencimiento."""
@@ -206,13 +292,13 @@ def ordenar(tareas: list[Tarea]) -> list[Tarea]:
 
 
 _DEMO = (
-    (31, "vela/landing", "Upload the new homepage photos", -8),
-    (12, "acme/web", "Renew hosting and SSL certificate", -3),
-    (48, "lumen/shop", "Change the checkout payment flow", 0),
-    (7, "nordic/erp", "Export this month's invoices to XML", 2),
-    (3, "vela/landing", "Tweak the homepage copy", 5),
-    (21, "korta/api", "Migrate webhooks to version 2", 19),
-    (9, "mesa/intranet", "Review permissions by user role", None),
+    (31, "vela/landing", "Upload the new homepage photos", -8, None),
+    (12, "acme/web", "Renew hosting and SSL certificate", -3, "monthly"),
+    (48, "lumen/shop", "Change the checkout payment flow", 0, None),
+    (7, "nordic/erp", "Export this month's invoices to XML", 2, "monthly"),
+    (3, "vela/landing", "Tweak the homepage copy", 5, None),
+    (21, "korta/api", "Migrate webhooks to version 2", 19, None),
+    (9, "mesa/intranet", "Review permissions by user role", None, None),
 )
 
 
@@ -234,8 +320,9 @@ class BackendDemo(Backend):
                     url=f"https://example.com/{repo}/issues/{numero}",
                     cuerpo="Sample request for the demo.\n\n- Detail one\n- Detail two",
                     vence=None if dias is None else hoy + timedelta(days=dias),
+                    repeat=repeat,
                 )
-                for numero, repo, titulo, dias in _DEMO
+                for numero, repo, titulo, dias, repeat in _DEMO
             ]
         )
 
@@ -252,7 +339,10 @@ class BackendDemo(Backend):
     async def repo_actual(self) -> str | None:
         return self._repo_actual
 
-    async def crear(self, repo: str, titulo: str, fecha: str | None) -> None:
+    async def crear(self, repo: str, titulo: str, fecha: str | None, cuerpo: str = "") -> None:
+        # Igual que el backend real: el cuerpo entra crudo y la repetición se vuelve a
+        # leer de ahí, así la demo ejercita el mismo ida y vuelta del metadato.
+        notas, repeat = separar_repeticion(cuerpo)
         numero = max((t.numero for t in self._tareas), default=0) + 1
         self._tareas = ordenar(
             [
@@ -263,8 +353,9 @@ class BackendDemo(Backend):
                     numero=numero,
                     titulo=titulo,
                     url=f"https://example.com/{repo}/issues/{numero}",
-                    cuerpo="Created in the demo.",
+                    cuerpo=notas,
                     vence=parsear_fecha(fecha),
+                    repeat=repeat,
                 ),
             ]
         )

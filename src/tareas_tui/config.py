@@ -50,9 +50,6 @@ campo_fecha = "Due date"
 
 # Name of the Status option that counts as done.
 estado_hecho = "Done"
-
-# Body text set on the issue when you create it from the TUI.
-cuerpo_nuevo = "Created from the tareas TUI."
 """
 
 
@@ -62,7 +59,6 @@ class Config:
     project: str
     campo_fecha: str
     estado_hecho: str
-    cuerpo_nuevo: str
     project_id: str
     campo_fecha_id: str
     project_title: str
@@ -163,7 +159,6 @@ def cargar(refrescar: bool = False) -> Config:
         project=project,
         campo_fecha=campo_fecha,
         estado_hecho=str(datos.get("estado_hecho", "Done")),
-        cuerpo_nuevo=str(datos.get("cuerpo_nuevo", "Created from the tareas TUI.")),
         project_id=project_id,
         campo_fecha_id=campo_id,
         project_title=titulo_proyecto,
