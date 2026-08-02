@@ -1,17 +1,22 @@
 """Interfaz textual: lista densa arriba, todo lo demás en modales.
 
-Dos reglas mandan sobre el diseño:
+Tres reglas mandan sobre el diseño:
 
 * **Cabe en un pane chico.** 80x15 es el caso de referencia; nada usa alto fijo y los
   anchos se recalculan en cada `Resize`, truncando con puntos suspensivos.
+* **Respira cuando hay lugar.** Desde `UMBRAL_HOLGADO` filas de pantalla los modales
+  separan sus grupos con una línea en blanco y ganan padding; bajo eso vuelven al
+  layout compacto. El alto de los diálogos siempre lo pone su contenido.
 * **Se opera con mouse.** Cada acción tiene un blanco clickeable: filas, botones de la
   cabecera, teclas del footer y botones dentro de los modales. El teclado es atajo.
 """
 
 from __future__ import annotations
 
+import functools
 from datetime import date, datetime, timedelta
 
+from rich.style import Style
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
@@ -25,11 +30,14 @@ from textual.widgets import Button, DataTable, Footer, Input, Markdown, OptionLi
 from textual.widgets.option_list import Option
 
 from .datos import (
+    ANCHO_REPEAT,
     ANCHO_VENCE,
+    REPETICIONES,
     Backend,
     ErrorGh,
     Tarea,
     acortar,
+    componer_cuerpo,
     etiqueta_vencimiento,
     fecha_larga,
     mas_un_mes,
@@ -38,6 +46,11 @@ from .datos import (
 REFRESCO_SEGUNDOS = 300.0
 ANCHO_CLIENTE_MAX = 22
 ANCHO_CLIENTE_MIN = 10
+# Filas de pantalla desde las que los modales respiran. El corte no es estético: el
+# modal más alto (nueva tarea, con el picker desplegado) mide 21 filas holgado, así que
+# 22 es el primer alto donde entra entero con margen. Debajo, layout compacto.
+UMBRAL_HOLGADO = 22
+ANCHO_ETIQUETA_REPEAT = max(len(r) for r in REPETICIONES)
 
 # ------------------------------------------------------------------------------------
 # Theme: hereda la paleta ANSI del terminal en vez de fijar colores propios.
@@ -101,6 +114,50 @@ THEME_TERMINAL = Theme(
 # ------------------------------------------------------------------------------------
 # Piezas reutilizables
 # ------------------------------------------------------------------------------------
+class TablaTareas(DataTable):
+    """DataTable cuya fila bajo el cursor se lee entera, sin `dim`.
+
+    `cursor_foreground_priority="css"` (el default) solo pisa el **color** del
+    renderable: Textual lo aplica como `Style.from_color(color=...)` en el `post_style`
+    de la celda, y ahí no hay forma de tocar los atributos. Una celda marcada `dim`
+    -la columna de repo, o un vencimiento lejano- se seguía difuminando contra el fondo
+    del cursor (el filtro ANSI resuelve `dim` mezclando texto y fondo), y sobre el
+    ámbar quedaba ilegible. Sumamos `dim=False` a ese mismo `post_style`, que es el
+    único punto del pipeline donde se puede cancelar un atributo del renderable.
+
+    El `lru_cache` no es optimización: DataTable llama a `cache_clear()` sobre este
+    método al invalidar sus cachés, así que sin el decorador la llamada revienta.
+    """
+
+    @functools.lru_cache(maxsize=32)  # noqa: B019 - misma estrategia que DataTable
+    def _get_styles_to_render_cell(
+        self,
+        is_header_cell: bool,
+        is_row_label_cell: bool,
+        is_fixed_style_cell: bool,
+        hover: bool,
+        cursor: bool,
+        show_cursor: bool,
+        show_hover_cursor: bool,
+        has_css_foreground_priority: bool,
+        has_css_background_priority: bool,
+    ) -> tuple[Style, Style]:
+        component_style, post_style = super()._get_styles_to_render_cell(
+            is_header_cell,
+            is_row_label_cell,
+            is_fixed_style_cell,
+            hover,
+            cursor,
+            show_cursor,
+            show_hover_cursor,
+            has_css_foreground_priority,
+            has_css_background_priority,
+        )
+        if cursor and show_cursor and not is_header_cell:
+            post_style += Style(dim=False)
+        return component_style, post_style
+
+
 class BotonCabecera(Static):
     """Acción clickeable de la cabecera; ocupa una fila y solo el ancho de su texto."""
 
@@ -185,9 +242,34 @@ class InputFecha(Input):
 
 
 class DialogoModal(ModalScreen):
-    """Base de los modales: `esc` cierra y un clic fuera del diálogo también."""
+    """Base de los modales: `esc` cierra, un clic fuera del diálogo también, y el
+    diálogo respira si la pantalla da para ello."""
 
     BINDINGS = [Binding("escape", "cancelar", "volver")]
+
+    def on_mount(self) -> None:
+        self._respirar()
+        self.al_montar()
+
+    def al_montar(self) -> None:
+        """Gancho de montaje de los modales: `on_mount` ya lo usa esta base."""
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._respirar()
+
+    def _respirar(self) -> None:
+        """Marca el diálogo como holgado o compacto según el alto de la pantalla."""
+        holgado = self.app.size.height >= UMBRAL_HOLGADO
+        for dialogo in self.query(".dlg"):
+            dialogo.set_class(holgado, "holgado")
+
+    def _avisar(self, mensaje: str) -> None:
+        """Muestra un error en la línea del hint: en un pane chico no sobran filas."""
+        for error in self.query(".error-linea"):
+            error.update(mensaje)
+            error.display = True
+        for hint in self.query(".hint"):
+            hint.display = False
 
     def action_cancelar(self) -> None:
         self.dismiss(None)
@@ -217,20 +299,33 @@ class DetalleScreen(DialogoModal):
     def compose(self) -> ComposeResult:
         with Vertical(id="dlg-detalle", classes="dlg"):
             yield Static(self.tarea.titulo, id="det-titulo")
-            yield Static(
-                f"{self.tarea.cliente} · {fecha_larga(self.tarea.vence, date.today())}",
-                id="det-meta",
-            )
+            yield Static(self._meta(), id="det-meta")
             with VerticalScroll(id="det-cuerpo"):
                 yield Markdown(self.tarea.cuerpo or "_(no description)_")
+            yield Static("", classes="respiro")
             with Horizontal(classes="fila-botones"):
                 yield Button("\\[close task]", id="det-cerrar", classes="chip peligro")
                 yield Button("\\[change date]", id="det-fecha", classes="chip")
                 yield Button("\\[back]", id="det-volver", classes="chip secundario")
             yield Static("j/k scroll · esc back", id="det-hint", classes="hint")
 
-    def on_mount(self) -> None:
+    def _meta(self) -> str:
+        partes = [self.tarea.cliente, fecha_larga(self.tarea.vence, date.today())]
+        if self.tarea.repeat:
+            partes.append(f"↻ repeats {self.tarea.repeat}")
+        return " · ".join(partes)
+
+    def al_montar(self) -> None:
         self.query_one("#det-cuerpo").focus()
+
+    def _respirar(self) -> None:
+        super()._respirar()
+        # El cuerpo se ajusta a lo que hay: una nota de una línea no debe abrir un
+        # modal gigante. El techo lo pone la pantalla menos el resto del diálogo
+        # (bordes, título, meta, separador, botones, hint y, si respira, su padding).
+        alto = self.app.size.height
+        for cuerpo in self.query("#det-cuerpo"):
+            cuerpo.styles.max_height = max(3, alto - (11 if alto >= UMBRAL_HOLGADO else 8))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
@@ -249,7 +344,7 @@ class FechaScreen(DialogoModal):
     BINDINGS = [
         Binding(str(i), f"quick_pick({i})", "", show=False, priority=True)
         for i in range(1, 6)
-    ]
+    ] + [Binding("ctrl+enter,ctrl+s", "guardar", "", show=False, priority=True)]
 
     def __init__(self, titulo: str, actual: date | None) -> None:
         super().__init__()
@@ -259,7 +354,9 @@ class FechaScreen(DialogoModal):
     def compose(self) -> ComposeResult:
         with Vertical(id="dlg-fecha", classes="dlg"):
             yield Static(f"due date · {acortar(self.titulo, 120)}", classes="dlg-titulo")
+            yield Static("", classes="respiro")
             yield AtajosFecha(classes="fila-chips")
+            yield Static("", classes="respiro")
             with Horizontal(classes="fila-botones"):
                 yield InputFecha(
                     value=self.actual.isoformat() if self.actual else "",
@@ -270,14 +367,19 @@ class FechaScreen(DialogoModal):
                 yield Button("\\[clear]", id="fecha-quitar", classes="chip peligro")
                 yield Button("\\[cancel]", id="fecha-cancelar", classes="chip secundario")
             yield Static("", id="fecha-error", classes="error-linea")
-            yield Static("1-5 quick · enter save · esc cancel", id="fecha-hint", classes="hint")
+            yield Static(
+                "1-5 quick · ^enter save · esc cancel", id="fecha-hint", classes="hint"
+            )
 
-    def on_mount(self) -> None:
+    def al_montar(self) -> None:
         self.query_one("#fecha-input", Input).focus()
 
     def action_quick_pick(self, indice: int) -> None:
         """Aplica y guarda de inmediato: `d`→número son dos teclas para fechar."""
         self.dismiss(AtajosFecha.fecha_por_indice(indice).isoformat())
+
+    def action_guardar(self) -> None:
+        self._guardar()
 
     def on_atajos_fecha_elegida(self, event: AtajosFecha.Elegida) -> None:
         event.stop()
@@ -306,15 +408,13 @@ class FechaScreen(DialogoModal):
         try:
             date.fromisoformat(texto)
         except ValueError:
-            error = self.query_one("#fecha-error", Static)
-            error.update("invalid format, use YYYY-MM-DD")
-            error.display = True
+            self._avisar("invalid format, use YYYY-MM-DD")
             return
         self.dismiss(texto)
 
 
 class NuevaScreen(DialogoModal):
-    """Alta de tarea. Devuelve {'repo','titulo','fecha'} o None.
+    """Alta de tarea. Devuelve {'repo','titulo','notas','fecha','repeat'} o None.
 
     Con `repo_prefijado` (modo repo) el picker arranca oculto y ese repo se muestra
     como una etiqueta clickeable; clickearla lo revela para elegir otro, igual que en
@@ -324,6 +424,9 @@ class NuevaScreen(DialogoModal):
     BINDINGS = [
         Binding(str(i), f"quick_pick({i})", "", show=False, priority=True)
         for i in range(1, 6)
+    ] + [
+        Binding("ctrl+enter,ctrl+s", "crear", "", show=False, priority=True),
+        Binding("ctrl+r", "ciclar_repeat", "", show=False, priority=True),
     ]
 
     def __init__(self, repos: list[str], repo_prefijado: str | None = None) -> None:
@@ -331,6 +434,7 @@ class NuevaScreen(DialogoModal):
         self.repos = repos
         self.repo_prefijado = repo_prefijado
         self.repo_elegido: str | None = repo_prefijado
+        self.repeticion: str = "none"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dlg-nueva", classes="dlg"):
@@ -342,20 +446,26 @@ class NuevaScreen(DialogoModal):
                 )
             yield Input(placeholder="filter repo…", id="nueva-filtro")
             yield OptionList(id="nueva-repos")
+            yield Static("", classes="respiro")
             yield Input(placeholder="what did they ask for?", id="nueva-titulo")
+            yield Input(placeholder="notes (optional)", id="nueva-notas")
+            yield Static("", classes="respiro")
             yield AtajosFecha(classes="fila-chips")
-            with Horizontal(classes="fila-botones"):
+            with Horizontal(classes="fila-fecha"):
                 yield InputFecha(placeholder="YYYY-MM-DD (optional)", id="nueva-fecha")
+                yield Button(self._etiqueta_repeat(), id="nueva-repeat", classes="chip")
+            yield Static("", classes="respiro")
+            with Horizontal(classes="fila-botones"):
                 yield Button("\\[create]", id="nueva-crear", classes="chip primario")
                 yield Button("\\[cancel]", id="nueva-cancelar", classes="chip secundario")
             yield Static("", id="nueva-error", classes="error-linea")
             yield Static(
-                "1-5 quick date · enter next/create · esc cancel",
+                "1-5 date · ^r repeat · ^enter create · esc cancel",
                 id="nueva-hint",
                 classes="hint",
             )
 
-    def on_mount(self) -> None:
+    def al_montar(self) -> None:
         if self.repo_prefijado is not None:
             # El picker ni se pinta: `_pintar_repos` dispara un OptionHighlighted
             # (async) que pisaría este repo_elegido con el primero de la lista.
@@ -388,6 +498,24 @@ class NuevaScreen(DialogoModal):
         lista.highlighted = 0
         self.repo_elegido = repos[0]
 
+    # ------------------------------------------------------------------ repetición
+    def _etiqueta_repeat(self) -> str:
+        """Etiqueta del chip, siempre del mismo largo.
+
+        Textual no vuelve a medir un Button con `width: auto` cuando le cambia el
+        label: el texto nuevo se cortaría a mitad. Rellenando todos los valores al
+        largo del más largo, el chip nunca cambia de ancho -así que ni se corta ni
+        hace bailar la fila al ciclar-.
+        """
+        return f"↻ repeat: {self.repeticion:<{ANCHO_ETIQUETA_REPEAT}}"
+
+    def action_ciclar_repeat(self) -> None:
+        siguiente = (REPETICIONES.index(self.repeticion) + 1) % len(REPETICIONES)
+        self.repeticion = REPETICIONES[siguiente]
+        chip = self.query_one("#nueva-repeat", Button)
+        chip.label = self._etiqueta_repeat()
+        chip.set_class(self.repeticion != "none", "primario")
+
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "nueva-filtro":
             return
@@ -416,12 +544,18 @@ class NuevaScreen(DialogoModal):
         event.stop()
         self.query_one("#nueva-fecha", Input).value = event.fecha.isoformat()
 
+    def action_crear(self) -> None:
+        self._crear()
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
-        if event.input.id == "nueva-filtro":
-            self.query_one("#nueva-titulo", Input).focus()
-        elif event.input.id == "nueva-titulo":
-            self.query_one("#nueva-fecha", Input).focus()
+        encadenado = {
+            "nueva-filtro": "nueva-titulo",
+            "nueva-titulo": "nueva-notas",
+            "nueva-notas": "nueva-fecha",
+        }.get(event.input.id or "")
+        if encadenado:
+            self.query_one(f"#{encadenado}", Input).focus()
         else:
             self._crear()
 
@@ -431,34 +565,51 @@ class NuevaScreen(DialogoModal):
         event.stop()
         if event.button.id == "nueva-crear":
             self._crear()
+        elif event.button.id == "nueva-repeat":
+            self.action_ciclar_repeat()
         else:
             self.dismiss(None)
 
     def _crear(self) -> None:
-        error = self.query_one("#nueva-error", Static)
         titulo = self.query_one("#nueva-titulo", Input).value.strip()
+        notas = self.query_one("#nueva-notas", Input).value.strip()
         fecha = self.query_one("#nueva-fecha", Input).value.strip()
         if not self.repo_elegido:
-            error.update("choose a repo from the list")
-            error.display = True
+            self._avisar("choose a repo from the list")
             filtro = self.query_one("#nueva-filtro", Input)
             if filtro.display:
                 filtro.focus()
             return
         if not titulo:
-            error.update("title is required")
-            error.display = True
+            self._avisar("title is required")
             self.query_one("#nueva-titulo", Input).focus()
             return
         if fecha:
             try:
                 date.fromisoformat(fecha)
             except ValueError:
-                error.update("invalid date, use YYYY-MM-DD")
-                error.display = True
+                self._avisar("invalid date, use YYYY-MM-DD")
                 self.query_one("#nueva-fecha", Input).focus()
                 return
-        self.dismiss({"repo": self.repo_elegido, "titulo": titulo, "fecha": fecha})
+        repeticion = self.repeticion
+        if repeticion != "none" and not fecha:
+            # Sin vencimiento no hay desde dónde contar el intervalo: se crea igual,
+            # pero el usuario tiene que enterarse de que la repetición no quedó.
+            self.app.notify(
+                "↻ repeat needs a due date: task created without it",
+                severity="warning",
+                timeout=6,
+            )
+            repeticion = "none"
+        self.dismiss(
+            {
+                "repo": self.repo_elegido,
+                "titulo": titulo,
+                "notas": notas,
+                "fecha": fecha,
+                "repeat": repeticion,
+            }
+        )
 
 
 class ConfirmaScreen(DialogoModal):
@@ -476,12 +627,13 @@ class ConfirmaScreen(DialogoModal):
     def compose(self) -> ComposeResult:
         with Vertical(id="dlg-confirma", classes="dlg"):
             yield Static(self.pregunta, classes="dlg-titulo")
+            yield Static("", classes="respiro")
             with Horizontal(classes="fila-botones"):
                 yield Button("\\[yes, close]", id="ok", classes="chip peligro")
                 yield Button("\\[cancel]", id="no", classes="chip secundario")
             yield Static("y close · n cancel", id="confirma-hint", classes="hint")
 
-    def on_mount(self) -> None:
+    def al_montar(self) -> None:
         self.query_one("#no", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -532,7 +684,7 @@ class ListaScreen(Screen):
             yield BotonCabecera("", "toggle_repo", id="cab-toggle", classes="cab-btn")
             yield BotonCabecera("+ new", "nueva", id="cab-nueva", classes="cab-btn")
             yield BotonCabecera("⟳", "refrescar", id="cab-refrescar", classes="cab-btn")
-        tabla: DataTable = DataTable(id="tabla")
+        tabla = TablaTareas(id="tabla")
         tabla.cursor_type = "row"
         tabla.show_header = False
         yield tabla
@@ -540,8 +692,9 @@ class ListaScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        tabla = self.query_one("#tabla", DataTable)
+        tabla = self.query_one("#tabla", TablaTareas)
         tabla.add_column("vence", width=ANCHO_VENCE, key="vence")
+        tabla.add_column("↻", width=ANCHO_REPEAT, key="repeat")
         tabla.add_column("cliente", width=ANCHO_CLIENTE_MAX, key="cliente")
         tabla.add_column("título", width=40, key="titulo")
         self._pintar_vacio()
@@ -598,7 +751,7 @@ class ListaScreen(Screen):
         return self.tareas
 
     def _pintar_tabla(self) -> None:
-        tabla = self.query_one("#tabla", DataTable)
+        tabla = self.query_one("#tabla", TablaTareas)
         recordado = tabla.cursor_row
         tabla.clear()
         visibles = self.visibles
@@ -614,7 +767,7 @@ class ListaScreen(Screen):
         # Responsive: los anchos se derivan del pane, nunca son fijos.
         util = max(tabla.scrollable_content_region.width or self.size.width, 24)
         relleno = 2 * tabla.cell_padding
-        disponible = util - ANCHO_VENCE - 3 * relleno
+        disponible = util - ANCHO_VENCE - ANCHO_REPEAT - 4 * relleno
         # La columna de cliente se ajusta al contenido real: si sobra, el hueco se lo
         # queda el título, que es lo que se lee.
         largo_cliente = max((len(t.cliente) for t in visibles), default=ANCHO_CLIENTE_MIN)
@@ -624,14 +777,17 @@ class ListaScreen(Screen):
         ancho_titulo = max(6, disponible - ancho_cliente)
 
         claves = list(tabla.columns)
-        tabla.columns[claves[1]].width = ancho_cliente
-        tabla.columns[claves[2]].width = ancho_titulo
+        tabla.columns[claves[2]].width = ancho_cliente
+        tabla.columns[claves[3]].width = ancho_titulo
 
         hoy = date.today()
         for tarea in visibles:
             texto, estilo = etiqueta_vencimiento(tarea.vence, hoy)
             tabla.add_row(
                 Text(texto, style=estilo),
+                # En acento y no en dim: una columna de un carácter ya es discreta, y
+                # el dim de esta paleta se queda en 3,98:1 sobre el fondo claro.
+                Text("↻" if tarea.repeat else "", style="yellow"),
                 Text(acortar(tarea.cliente, ancho_cliente), style="dim"),
                 Text(acortar(tarea.titulo, ancho_titulo)),
                 key=tarea.item_id,
@@ -741,7 +897,7 @@ class ListaScreen(Screen):
         visibles = self.visibles
         if not visibles:
             return None
-        fila = self.query_one("#tabla", DataTable).cursor_row
+        fila = self.query_one("#tabla", TablaTareas).cursor_row
         return visibles[fila] if 0 <= fila < len(visibles) else None
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -760,19 +916,19 @@ class ListaScreen(Screen):
             self.action_refrescar()
 
     def action_abajo(self) -> None:
-        self.query_one("#tabla", DataTable).action_cursor_down()
+        self.query_one("#tabla", TablaTareas).action_cursor_down()
 
     def action_arriba(self) -> None:
-        self.query_one("#tabla", DataTable).action_cursor_up()
+        self.query_one("#tabla", TablaTareas).action_cursor_up()
 
     def action_inicio(self) -> None:
         if self.visibles:
-            self.query_one("#tabla", DataTable).cursor_coordinate = Coordinate(0, 0)
+            self.query_one("#tabla", TablaTareas).cursor_coordinate = Coordinate(0, 0)
 
     def action_fin(self) -> None:
         if self.visibles:
             ultima = len(self.visibles) - 1
-            self.query_one("#tabla", DataTable).cursor_coordinate = Coordinate(ultima, 0)
+            self.query_one("#tabla", TablaTareas).cursor_coordinate = Coordinate(ultima, 0)
 
     def action_refrescar(self) -> None:
         self.refrescar()
@@ -822,7 +978,12 @@ class ListaScreen(Screen):
         if not datos:
             return
         try:
-            await self.backend.crear(datos["repo"], datos["titulo"], datos["fecha"] or None)
+            await self.backend.crear(
+                datos["repo"],
+                datos["titulo"],
+                datos["fecha"] or None,
+                componer_cuerpo(datos["notas"], datos["repeat"]),
+            )
         except (ErrorGh, IndexError, OSError) as err:
             self.notify(f"couldn't create the task: {err}", severity="error", timeout=6)
             return
@@ -851,7 +1012,33 @@ class ListaScreen(Screen):
             self.notify(f"couldn't close the task: {err}", severity="error", timeout=6)
             return
         self.notify(f"closed {tarea.cliente}", timeout=3)
+        if tarea.repeat:
+            await self._repetir(tarea)
         self.refrescar()
+
+    async def _repetir(self, tarea: Tarea) -> None:
+        """Siguiente ocurrencia de una repetitiva recién cerrada.
+
+        El cierre ya ocurrió: si esto falla hay que decirlo fuerte, o la serie se corta
+        en silencio y el usuario recién se entera cuando la tarea no vuelve.
+        """
+        if tarea.vence is None:
+            self.notify(
+                "↻ no due date on this task: next occurrence not created",
+                severity="warning",
+                timeout=6,
+            )
+            return
+        try:
+            proxima = await self.backend.repetir(tarea, date.today())
+        except (ErrorGh, IndexError, OSError, ValueError) as err:
+            self.notify(
+                f"closed, but couldn't create the next occurrence: {err}",
+                severity="error",
+                timeout=8,
+            )
+            return
+        self.notify(f"↻ next: {proxima.isoformat()}", timeout=4)
 
 
 # ------------------------------------------------------------------------------------
@@ -877,16 +1064,26 @@ class TareasApp(App):
     }
     Footer { height: 1; }
 
-    /* Modales: todo relativo al viewport, nada con medidas fijas. */
+    /* Modales: todo relativo al viewport, nada con medidas fijas. El alto lo pone el
+       contenido (height: auto), así un detalle de una línea no abre un modal enorme. */
     DialogoModal { align: center middle; }
     .dlg {
         background: $surface; border: round $accent; padding: 0 1;
-        width: 90%; max-width: 100; height: auto; max-height: 90%;
+        width: 90%; max-width: 100; height: auto; max-height: 100%;
     }
+    /* Respiración adaptativa: la clase "holgado" la pone el modal cuando la pantalla
+       tiene UMBRAL_HOLGADO filas o más. Los separadores existen siempre en el árbol y
+       solo aparecen ahí, así el layout compacto queda idéntico al de antes. */
+    .dlg.holgado { padding: 1 2; }
+    .respiro { display: none; height: 1; width: 100%; }
+    .holgado .respiro { display: block; }
+
     .dlg-titulo { height: 1; color: $accent; text-style: bold; }
     .fila-chips { height: 1; width: 100%; }
+    .fila-fecha { height: 1; width: 100%; }
     .fila-botones { height: 1; width: 100%; }
-    .error-linea { height: auto; color: $error; display: none; }
+    /* El error ocupa la fila del hint en vez de sumar una: en 80x15 no sobra ninguna. */
+    .error-linea { height: 1; width: 100%; color: $error; display: none; }
     .hint { height: 1; width: 100%; color: $foreground; text-style: dim; }
 
     /* Botones de una fila: clickeables sin engordar la UI.
@@ -903,28 +1100,39 @@ class TareasApp(App):
         text-style: none;
     }
     .chip:hover, .chip:focus { text-style: bold reverse; }
+    /* Los 5 quick-picks miden 67 columnas justas y en 80x15 el diálogo da 68: con el
+       margen derecho de .chip (5 columnas más) el último quedaba cortado por el borde.
+       El padding propio de cada chip ya los separa. */
+    .fila-chips .chip { margin: 0; }
     .primario { text-style: bold; }
     .peligro { color: ansi_red; }
     .secundario { color: ansi_default; text-style: dim; }
 
-    #dlg-detalle { height: 90%; }
     #det-titulo { height: auto; max-height: 2; text-style: bold; }
     #det-meta { height: 1; color: $accent; }
+    /* auto + max-height (que fija el modal según la pantalla) para que el cuerpo
+       abrace su contenido en vez de estirar el diálogo hasta el borde. */
     #det-cuerpo {
-        height: 1fr; width: 100%; scrollbar-size-vertical: 1; border-top: solid $panel;
+        height: auto; min-height: 1; width: 100%; scrollbar-size-vertical: 1;
+        border-top: solid $panel;
     }
 
-    /* auto (no 1fr) para que la lista abrace a sus opciones y no deje hueco muerto */
+    /* auto (no 1fr) para que la lista abrace a sus opciones y no deje hueco muerto;
+       el techo sube cuando el modal respira. overflow-x oculto para que un repo largo
+       no gaste una fila en una barra horizontal. */
     #nueva-repos {
-        height: auto; max-height: 6; border: none; background: $background;
+        height: auto; max-height: 4; border: none; background: $background;
+        overflow-x: hidden;
     }
+    .holgado #nueva-repos { max-height: 6; }
     /* border-left literal (marcador de "esto es un input"): a diferencia de
        border-bottom, no consume una fila extra con height:1 (verificado). */
-    #nueva-filtro, #nueva-titulo, #nueva-fecha, #fecha-input {
+    #nueva-filtro, #nueva-titulo, #nueva-notas, #nueva-fecha, #fecha-input {
         height: 1; border: none; border-left: solid ansi_default; padding: 0 1;
         background: $background; width: 1fr;
     }
-    #nueva-filtro:focus, #nueva-titulo:focus, #nueva-fecha:focus, #fecha-input:focus {
+    #nueva-filtro:focus, #nueva-titulo:focus, #nueva-notas:focus,
+    #nueva-fecha:focus, #fecha-input:focus {
         border-left: solid ansi_yellow;
     }
     #nueva-fecha, #fecha-input { max-width: 24; }

@@ -14,6 +14,3 @@ campo_fecha = "Due date"
 
 # Name of the Status option that counts as done.
 estado_hecho = "Done"
-
-# Body text set on the issue when you create it from the TUI.
-cuerpo_nuevo = "Created from the tareas TUI."
