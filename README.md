@@ -85,14 +85,19 @@ campo_fecha = "Due date"      # name of the Date-type field
 estado_hecho = "Done"         # Status option that counts as done
 ```
 
+If you rename the date field on GitHub without updating `campo_fecha`, the app
+keeps reading it by its id — which a rename doesn't change — and says so, instead
+of quietly showing every task with no due date.
+
 No need to look up internal identifiers: the app resolves the Project's node IDs
 with `gh` on first run and caches them in `~/.config/tareas/ids-cache.json`. If you
 ever change the Project, delete that file and they get resolved again — that's
 also when the app picks up a renamed Project title (see below).
 
 Next to it, `~/.config/tareas/datos-cache.json` keeps the last good read (tasks,
-repo list, and which repo each directory belongs to) so the list is on screen from
-the first frame instead of after a round trip to GitHub. It refreshes in the
+repo list, which repo each directory belongs to, and which tasks you closed from
+here) so the list is on screen from the first frame instead of after a round trip
+to GitHub. It refreshes in the
 background right away, and the `⟳ 3m ago` in the header always tells you how old
 what you're looking at is. The file is disposable: delete it and the next start
 just goes back to asking `gh` for everything.
@@ -281,9 +286,11 @@ The code is four modules: `config.py` (configuration and ID resolution),
 the last good read), and `app.py` (the interface). Tests are split the same way:
 `tests/test_repeticion.py` covers the recurrence math on its own,
 `tests/test_backend.py` covers the `gh` layer (timeouts, orphaned subprocesses,
-partial writes, the item limit) against a fake `gh`, `tests/test_cache.py` covers
-the disk cache (round trip, corrupt or stale files, and that the demo never touches
-it), and `tests/test_app.py` drives the interface with textual's Pilot. The whole
+partial writes, the item limit, a renamed date field) against a fake `gh`,
+`tests/test_cache.py` covers the disk cache (round trip, corrupt or stale files,
+and that the demo never touches it), `tests/test_arranque.py` covers the entry
+point guards (no terminal, unreadable config), and `tests/test_app.py` drives the
+interface with textual's Pilot. The whole
 suite runs without the GitHub CLI installed and without credentials or network,
 which is what CI does on Python 3.11 and 3.12 — and `tests/conftest.py` points
 `XDG_CONFIG_HOME` at a temporary directory so it never reads or writes the config

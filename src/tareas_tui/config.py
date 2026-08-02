@@ -79,6 +79,12 @@ def _leer_toml() -> dict:
             return tomllib.load(fh)
     except tomllib.TOMLDecodeError as err:
         raise ErrorConfig(f"{ruta} is not valid TOML: {err}") from err
+    except OSError as err:
+        # Sin permiso de lectura (o disco con problemas) esto escapaba hasta arriba
+        # como traceback y salía con código 1, que `bin/tareas` lee como caída
+        # transitoria: la app se relanzaba cada 2 s para siempre. Como ErrorConfig
+        # sale con 2, que es final.
+        raise ErrorConfig(f"I couldn't read {ruta}: {err}") from err
 
 
 def _gh(*args: str) -> str:

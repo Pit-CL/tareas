@@ -9,6 +9,7 @@ siguiente ocurrencia).
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 
@@ -1469,3 +1470,139 @@ async def test_salir_con_una_lectura_en_vuelo_no_revienta():
         assert not backend.suelta.is_set()  # la lectura sigue en vuelo al salir
     # al cerrar el contexto, `run_test` relanza cualquier excepción de worker: que no
     # haya excepción ES la prueba.
+
+
+# ------------------------------------------------------------------ fantasmas del caché
+CONFIG_REAL = datos.Config(
+    owner="pit",
+    project="1",
+    campo_fecha="Due date",
+    estado_hecho="Done",
+    project_id="PVT_test",
+    campo_fecha_id="PVTF_test",
+    project_title="Client Tasks",
+)
+
+
+def _gh_project_zombi(repeat: str | None = None, creados: list | None = None):
+    """`gh` de mentira cuyo Project NUNCA marca Done lo que se cierra.
+
+    Es el comportamiento real: el Status lo pone un workflow de Projects que corre
+    después de que `gh issue close` volvió, y puede tardar. Mientras tanto la tarea
+    sigue llegando como pendiente en cada `item-list`.
+    """
+    cuerpo = f"<!-- tareas:repeat={repeat} -->" if repeat else ""
+
+    async def falso(*args: str) -> str:
+        if args[:2] == ("project", "item-list"):
+            return json.dumps(
+                {
+                    "items": [
+                        {
+                            "id": "PVTI_1",
+                            "status": "Todo",
+                            "content": {
+                                "type": "Issue",
+                                "repository": "pit/web",
+                                "number": 1,
+                                "title": "Renew SSL",
+                                "url": "https://github.com/pit/web/issues/1",
+                                "body": cuerpo,
+                            },
+                            "due date": "2026-08-01",
+                        }
+                    ]
+                }
+            )
+        if args[:2] == ("issue", "create"):
+            numero = 100 + len(creados if creados is not None else [])
+            if creados is not None:
+                creados.append(numero)
+            return f"https://github.com/pit/web/issues/{numero}\n"
+        if args[:2] == ("project", "item-add"):
+            return "PVTI_nueva\n"
+        if args[:2] == ("repo", "list"):
+            return "[]"
+        return ""
+
+    return falso
+
+
+async def _cerrar_la_primera(pilot, screen) -> None:
+    await _esperar(pilot, lambda: not screen.cargando)
+    await pilot.pause()
+    assert screen.visibles, "la tarea debería estar en pantalla"
+    await pilot.press("x")
+    await _esperar(pilot, lambda: isinstance(pilot.app.screen, ConfirmaScreen))
+    await pilot.press("y")
+    await _esperar(pilot, lambda: not screen.visibles)
+
+
+async def test_una_tarea_cerrada_no_revive_al_reiniciar_la_app(monkeypatch):
+    """El caché guardaba la lista cruda del Project -con la recién cerrada dentro- y
+    `self.cerradas` vivía solo en memoria: al reabrir la app la tarea reaparecía como
+    pendiente aunque su issue ya estuviera cerrado en GitHub."""
+    monkeypatch.setattr(datos, "gh", _gh_project_zombi())
+
+    app = TareasApp(datos.Backend(CONFIG_REAL))
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _cerrar_la_primera(pilot, pilot.app.screen)
+
+    # proceso nuevo: `self.cerradas` nace vacío y solo queda lo que haya en disco
+    otra = TareasApp(datos.Backend(CONFIG_REAL))
+    async with otra.run_test(size=(110, 24)) as pilot:
+        screen = pilot.app.screen
+        await pilot.pause()
+        assert screen.tareas == [], "la cerrada revivió desde el caché"
+        assert "PVTI_1" in screen.cerradas  # y se sabe por qué está oculta
+        await _esperar(pilot, lambda: screen.ultimo_ok is not None)
+        await pilot.pause()
+        assert screen.tareas == [], "el refresco la volvió a traer"
+
+
+async def test_reiniciar_no_duplica_la_ocurrencia_de_una_repetitiva(monkeypatch):
+    """La consecuencia cara del fantasma: cerrarlo otra vez creaba en GitHub una
+    segunda ocurrencia con la MISMA fecha, sin forma de saber cuál sobra."""
+    creados: list[int] = []
+    monkeypatch.setattr(datos, "gh", _gh_project_zombi(repeat="monthly", creados=creados))
+
+    app = TareasApp(datos.Backend(CONFIG_REAL))
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _cerrar_la_primera(pilot, pilot.app.screen)
+    assert creados == [100], "la primera ocurrencia debería crearse una sola vez"
+
+    otra = TareasApp(datos.Backend(CONFIG_REAL))
+    async with otra.run_test(size=(110, 24)) as pilot:
+        screen = pilot.app.screen
+        await pilot.pause()
+        assert screen.visibles == [], "no hay fantasma que cerrar"
+    assert creados == [100], "se creó una ocurrencia duplicada"
+
+
+async def test_repetir_no_crea_una_ocurrencia_que_ya_esta_en_la_lista():
+    """Guarda independiente del caché: cubre cerrar dos veces la misma repetitiva
+    (dos instancias abiertas, o reabierta en GitHub) sin duplicar la serie."""
+    backend = BackendDemo()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        await pilot.press("j")
+        tarea = screen.seleccionada
+        assert tarea.repeat == "monthly" and tarea.vence is not None
+
+        proxima = proxima_fecha(tarea.vence, "monthly", date.today())
+        gemela = replace(tarea, item_id="ya-existe", vence=proxima)
+        screen.tareas = [*screen.tareas, gemela]
+
+        creadas: list[str] = []
+
+        async def registrar(t, hoy):
+            creadas.append(t.item_id)
+            return gemela
+
+        backend.repetir = registrar
+        await screen._repetir(tarea)
+        await pilot.pause()
+
+        assert creadas == [], "creó una ocurrencia que ya existía"
+        assert any("already exists" in m for m in _avisos(pilot.app))

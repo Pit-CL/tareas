@@ -8,6 +8,17 @@ import sys
 
 
 def main() -> int:
+    # Sin terminal de verdad textual no dibuja: se queda escribiendo secuencias ANSI
+    # a un pipe para siempre (medido: 22 MB de stderr en 20 s) y ni ctrl-c la saca,
+    # porque tampoco hay quien mande teclas. Pasa con `ssh host tareas` sin `-t`.
+    # El código 2 es el que `bin/tareas` NO relanza: reintentar no arregla un pipe.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(
+            "tareas: needs an interactive terminal (with ssh, use `ssh -t host tareas`)",
+            file=sys.stderr,
+        )
+        return 2
+
     from .app import TareasApp
     from .datos import Backend, BackendDemo
 
