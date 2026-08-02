@@ -123,6 +123,8 @@ class AtajosFecha(Horizontal):
 
     Preferimos esto a un calendario: el date picker mantenido para textual
     (textual-timepiece) despliega un overlay de 19 filas, que no entra en un pane de 15.
+    Cada chip también responde a su número (1-5): lo resuelven los modales que la
+    contienen, con prioridad sobre el campo de fecha (ver `InputFecha`).
     """
 
     OPCIONES: tuple[tuple[str, str], ...] = (
@@ -139,22 +141,47 @@ class AtajosFecha(Horizontal):
             super().__init__()
 
     def compose(self) -> ComposeResult:
-        for etiqueta, clave in self.OPCIONES:
-            yield Button(etiqueta, id=f"qp-{clave}", classes="chip")
+        for indice, (etiqueta, clave) in enumerate(self.OPCIONES, start=1):
+            yield Button(f"{indice}·{etiqueta}", id=f"qp-{clave}", classes="chip")
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if not (event.button.id or "").startswith("qp-"):
-            return
-        event.stop()
+    @staticmethod
+    def fecha(clave: str) -> date:
         hoy = date.today()
-        elegida = {
+        return {
             "hoy": hoy,
             "manana": hoy + timedelta(days=1),
             "mas3": hoy + timedelta(days=3),
             "semana": hoy + timedelta(days=7),
             "mes": mas_un_mes(hoy),
-        }[event.button.id[3:]]
-        self.post_message(self.Elegida(elegida))
+        }[clave]
+
+    @classmethod
+    def fecha_por_indice(cls, indice: int) -> date:
+        """`indice` 1-5, en el orden de `OPCIONES` (atajos numéricos de los modales)."""
+        _, clave = cls.OPCIONES[indice - 1]
+        return cls.fecha(clave)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if not (event.button.id or "").startswith("qp-"):
+            return
+        event.stop()
+        self.post_message(self.Elegida(self.fecha(event.button.id[3:])))
+
+
+class InputFecha(Input):
+    """Input de fecha que libera las teclas 1-5 hacia los atajos numéricos del modal
+    mientras está vacío; si ya tiene texto (fecha manual en curso o precargada), el
+    dígito se escribe como cualquier otro carácter.
+
+    Textual no deja que un binding de prioridad "gane" a un Input si este declara que
+    consume esa tecla (`check_consume_key`): por eso el corte se resuelve acá, no con
+    lógica en el modal.
+    """
+
+    def check_consume_key(self, key: str, character: str | None) -> bool:
+        if key in {"1", "2", "3", "4", "5"} and not self.value:
+            return False
+        return super().check_consume_key(key, character)
 
 
 class DialogoModal(ModalScreen):
@@ -178,6 +205,11 @@ class DialogoModal(ModalScreen):
 class DetalleScreen(DialogoModal):
     """Detalle del issue. Devuelve 'cerrar', 'fecha' o None."""
 
+    BINDINGS = [
+        Binding("j", "abajo", "", show=False),
+        Binding("k", "arriba", "", show=False),
+    ]
+
     def __init__(self, tarea: Tarea) -> None:
         super().__init__()
         self.tarea = tarea
@@ -195,6 +227,7 @@ class DetalleScreen(DialogoModal):
                 yield Button("close task", id="det-cerrar", classes="chip peligro")
                 yield Button("change date", id="det-fecha", classes="chip")
                 yield Button("back", id="det-volver", classes="chip")
+            yield Static("j/k scroll · esc back", id="det-hint", classes="hint")
 
     def on_mount(self) -> None:
         self.query_one("#det-cuerpo").focus()
@@ -203,9 +236,20 @@ class DetalleScreen(DialogoModal):
         event.stop()
         self.dismiss({"det-cerrar": "cerrar", "det-fecha": "fecha"}.get(event.button.id or ""))
 
+    def action_abajo(self) -> None:
+        self.query_one("#det-cuerpo", VerticalScroll).scroll_down()
+
+    def action_arriba(self) -> None:
+        self.query_one("#det-cuerpo", VerticalScroll).scroll_up()
+
 
 class FechaScreen(DialogoModal):
     """Elegir vencimiento. Devuelve 'AAAA-MM-DD', '' para quitarlo, o None."""
+
+    BINDINGS = [
+        Binding(str(i), f"quick_pick({i})", "", show=False, priority=True)
+        for i in range(1, 6)
+    ]
 
     def __init__(self, titulo: str, actual: date | None) -> None:
         super().__init__()
@@ -217,7 +261,7 @@ class FechaScreen(DialogoModal):
             yield Static(f"due date · {acortar(self.titulo, 120)}", classes="dlg-titulo")
             yield AtajosFecha(classes="fila-chips")
             with Horizontal(classes="fila-botones"):
-                yield Input(
+                yield InputFecha(
                     value=self.actual.isoformat() if self.actual else "",
                     placeholder="YYYY-MM-DD",
                     id="fecha-input",
@@ -226,9 +270,14 @@ class FechaScreen(DialogoModal):
                 yield Button("clear", id="fecha-quitar", classes="chip")
                 yield Button("cancel", id="fecha-cancelar", classes="chip")
             yield Static("", id="fecha-error", classes="error-linea")
+            yield Static("1-5 quick · enter save · esc cancel", id="fecha-hint", classes="hint")
 
     def on_mount(self) -> None:
         self.query_one("#fecha-input", Input).focus()
+
+    def action_quick_pick(self, indice: int) -> None:
+        """Aplica y guarda de inmediato: `d`→número son dos teclas para fechar."""
+        self.dismiss(AtajosFecha.fecha_por_indice(indice).isoformat())
 
     def on_atajos_fecha_elegida(self, event: AtajosFecha.Elegida) -> None:
         event.stop()
@@ -270,6 +319,11 @@ class NuevaScreen(DialogoModal):
     modo todas.
     """
 
+    BINDINGS = [
+        Binding(str(i), f"quick_pick({i})", "", show=False, priority=True)
+        for i in range(1, 6)
+    ]
+
     def __init__(self, repos: list[str], repo_prefijado: str | None = None) -> None:
         super().__init__()
         self.repos = repos
@@ -289,10 +343,15 @@ class NuevaScreen(DialogoModal):
             yield Input(placeholder="what did they ask for?", id="nueva-titulo")
             yield AtajosFecha(classes="fila-chips")
             with Horizontal(classes="fila-botones"):
-                yield Input(placeholder="YYYY-MM-DD (optional)", id="nueva-fecha")
+                yield InputFecha(placeholder="YYYY-MM-DD (optional)", id="nueva-fecha")
                 yield Button("create", id="nueva-crear", classes="chip")
                 yield Button("cancel", id="nueva-cancelar", classes="chip")
             yield Static("", id="nueva-error", classes="error-linea")
+            yield Static(
+                "1-5 quick date · enter next/create · esc cancel",
+                id="nueva-hint",
+                classes="hint",
+            )
 
     def on_mount(self) -> None:
         if self.repo_prefijado is not None:
@@ -345,6 +404,12 @@ class NuevaScreen(DialogoModal):
             self.repo_elegido = event.option.id
         self.query_one("#nueva-titulo", Input).focus()
 
+    def action_quick_pick(self, indice: int) -> None:
+        """Solo marca la fecha elegida: falta el título, así que no crea todavía."""
+        self.query_one("#nueva-fecha", Input).value = AtajosFecha.fecha_por_indice(
+            indice
+        ).isoformat()
+
     def on_atajos_fecha_elegida(self, event: AtajosFecha.Elegida) -> None:
         event.stop()
         self.query_one("#nueva-fecha", Input).value = event.fecha.isoformat()
@@ -353,6 +418,8 @@ class NuevaScreen(DialogoModal):
         event.stop()
         if event.input.id == "nueva-filtro":
             self.query_one("#nueva-titulo", Input).focus()
+        elif event.input.id == "nueva-titulo":
+            self.query_one("#nueva-fecha", Input).focus()
         else:
             self._crear()
 
@@ -371,6 +438,9 @@ class NuevaScreen(DialogoModal):
         fecha = self.query_one("#nueva-fecha", Input).value.strip()
         if not self.repo_elegido:
             error.update("choose a repo from the list")
+            filtro = self.query_one("#nueva-filtro", Input)
+            if filtro.display:
+                filtro.focus()
             return
         if not titulo:
             error.update("title is required")
@@ -381,12 +451,18 @@ class NuevaScreen(DialogoModal):
                 date.fromisoformat(fecha)
             except ValueError:
                 error.update("invalid date, use YYYY-MM-DD")
+                self.query_one("#nueva-fecha", Input).focus()
                 return
         self.dismiss({"repo": self.repo_elegido, "titulo": titulo, "fecha": fecha})
 
 
 class ConfirmaScreen(DialogoModal):
     """Confirmación de una acción destructiva. Devuelve True/False."""
+
+    BINDINGS = [
+        Binding("y", "confirmar", "", show=False),
+        Binding("n", "rechazar", "", show=False),
+    ]
 
     def __init__(self, pregunta: str) -> None:
         super().__init__()
@@ -398,6 +474,7 @@ class ConfirmaScreen(DialogoModal):
             with Horizontal(classes="fila-botones"):
                 yield Button("yes, close", id="ok", classes="chip peligro")
                 yield Button("cancel", id="no", classes="chip")
+            yield Static("y close · n cancel", id="confirma-hint", classes="hint")
 
     def on_mount(self) -> None:
         self.query_one("#no", Button).focus()
@@ -405,6 +482,12 @@ class ConfirmaScreen(DialogoModal):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
         self.dismiss(event.button.id == "ok")
+
+    def action_confirmar(self) -> None:
+        self.dismiss(True)
+
+    def action_rechazar(self) -> None:
+        self.dismiss(False)
 
 
 # ------------------------------------------------------------------------------------
@@ -423,6 +506,8 @@ class ListaScreen(Screen):
         Binding("q", "salir", "quit"),
         Binding("j", "abajo", "", show=False),
         Binding("k", "arriba", "", show=False),
+        Binding("g", "inicio", "", show=False),
+        Binding("G", "fin", "", show=False),
     ]
 
     def __init__(self, backend: Backend) -> None:
@@ -577,15 +662,28 @@ class ListaScreen(Screen):
             )
 
     def _pintar_cabecera(self) -> None:
-        cuantas = len(self.visibles)
+        visibles = self.visibles
+        cuantas = len(visibles)
+        hoy = date.today()
+        vencidas = sum(1 for t in visibles if t.vence is not None and t.vence < hoy)
+
+        # Segmentos (texto, estilo) del contador: la parte "overdue" usa el mismo rojo
+        # semántico que las filas vencidas, para que el header se lea de un vistazo.
         if self.cargando:
-            estado = "loading…"
+            estado: list[tuple[str, str]] = [("loading…", "yellow")]
         elif self.ultimo_error:
-            estado = "no connection"
+            estado = [("no connection", "yellow")]
         elif cuantas == 0:
-            estado = "nothing pending"
+            estado = [("nothing pending", "yellow")]
+        elif vencidas:
+            estado = [
+                (f"{cuantas} pending", "yellow"),
+                (" · ", "dim"),
+                (f"{vencidas} overdue", "bold red"),
+            ]
         else:
-            estado = f"{cuantas} pending"
+            estado = [(f"{cuantas} pending", "yellow")]
+        estado_texto = "".join(texto for texto, _ in estado)
 
         if self.modo_repo and self.repo_actual:
             etiqueta_titulo = self.repo_actual
@@ -603,13 +701,13 @@ class ListaScreen(Screen):
         if toggle.display:
             reservado += len(etiqueta_toggle) + 2
         disponible_titulo = max(6, self.size.width - reservado)
-        disponible_repo = max(3, disponible_titulo - len(separador) - len(estado))
+        disponible_repo = max(3, disponible_titulo - len(separador) - len(estado_texto))
 
         self.query_one("#cab-titulo", Static).update(
             Text.assemble(
                 (acortar(etiqueta_titulo, disponible_repo), "bold"),
                 (separador, "dim"),
-                (estado, "yellow"),
+                *estado,
             )
         )
         self.query_one("#cab-refrescar", BotonCabecera).update(
@@ -661,6 +759,15 @@ class ListaScreen(Screen):
 
     def action_arriba(self) -> None:
         self.query_one("#tabla", DataTable).action_cursor_up()
+
+    def action_inicio(self) -> None:
+        if self.visibles:
+            self.query_one("#tabla", DataTable).cursor_coordinate = Coordinate(0, 0)
+
+    def action_fin(self) -> None:
+        if self.visibles:
+            ultima = len(self.visibles) - 1
+            self.query_one("#tabla", DataTable).cursor_coordinate = Coordinate(ultima, 0)
 
     def action_refrescar(self) -> None:
         self.refrescar()
@@ -775,6 +882,7 @@ class TareasApp(App):
     .fila-chips { height: 1; width: 100%; }
     .fila-botones { height: 1; width: 100%; }
     .error-linea { height: auto; color: $error; }
+    .hint { height: 1; width: 100%; color: $foreground; text-style: dim; }
 
     /* Botones de una fila: clickeables sin engordar la UI. */
     /* El fondo va literal (color 8) y no por variable: las variables propias del theme
