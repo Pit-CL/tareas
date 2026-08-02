@@ -263,16 +263,27 @@ class FechaScreen(DialogoModal):
 
 
 class NuevaScreen(DialogoModal):
-    """Alta de tarea. Devuelve {'repo','titulo','fecha'} o None."""
+    """Alta de tarea. Devuelve {'repo','titulo','fecha'} o None.
 
-    def __init__(self, repos: list[str]) -> None:
+    Con `repo_prefijado` (modo repo) el picker arranca oculto y ese repo se muestra
+    como una etiqueta clickeable; clickearla lo revela para elegir otro, igual que en
+    modo todas.
+    """
+
+    def __init__(self, repos: list[str], repo_prefijado: str | None = None) -> None:
         super().__init__()
         self.repos = repos
-        self.repo_elegido: str | None = None
+        self.repo_prefijado = repo_prefijado
+        self.repo_elegido: str | None = repo_prefijado
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dlg-nueva", classes="dlg"):
             yield Static("nueva tarea", classes="dlg-titulo")
+            if self.repo_prefijado is not None:
+                yield BotonCabecera(
+                    f"repo: {self.repo_prefijado}", "cambiar-repo",
+                    id="nueva-repo-fijo", classes="chip",
+                )
             yield Input(placeholder="filtrar cliente/repo…", id="nueva-filtro")
             yield OptionList(id="nueva-repos")
             yield Input(placeholder="¿qué te pidieron?", id="nueva-titulo")
@@ -284,7 +295,25 @@ class NuevaScreen(DialogoModal):
             yield Static("", id="nueva-error", classes="error-linea")
 
     def on_mount(self) -> None:
+        if self.repo_prefijado is not None:
+            # El picker ni se pinta: `_pintar_repos` dispara un OptionHighlighted
+            # (async) que pisaría este repo_elegido con el primero de la lista.
+            self.repo_elegido = self.repo_prefijado
+            self.query_one("#nueva-filtro", Input).display = False
+            self.query_one("#nueva-repos", OptionList).display = False
+            self.query_one("#nueva-titulo", Input).focus()
+        else:
+            self._pintar_repos(self.repos)
+            self.query_one("#nueva-filtro", Input).focus()
+
+    def on_boton_cabecera_pulsado(self, event: BotonCabecera.Pulsado) -> None:
+        if event.accion != "cambiar-repo":
+            return
+        event.stop()
+        self.query_one("#nueva-repo-fijo").remove()
         self._pintar_repos(self.repos)
+        self.query_one("#nueva-filtro", Input).display = True
+        self.query_one("#nueva-repos", OptionList).display = True
         self.query_one("#nueva-filtro", Input).focus()
 
     def _pintar_repos(self, repos: list[str]) -> None:
@@ -390,6 +419,7 @@ class ListaScreen(Screen):
         Binding("d", "fecha", "fecha"),
         Binding("x", "cerrar", "cerrar"),
         Binding("r", "refrescar", "refrescar"),
+        Binding("t", "toggle_repo", "repo"),
         Binding("q", "salir", "salir"),
         Binding("j", "abajo", "", show=False),
         Binding("k", "arriba", "", show=False),
@@ -400,6 +430,8 @@ class ListaScreen(Screen):
         self.backend = backend
         self.tareas: list[Tarea] = []
         self.repos: list[str] = []
+        self.repo_actual: str | None = None
+        self.modo_repo = False
         self.ultimo_ok: datetime | None = None
         self.ultimo_error: str | None = None
         self.cargando = True
@@ -407,6 +439,7 @@ class ListaScreen(Screen):
     def compose(self) -> ComposeResult:
         with Horizontal(id="cabecera"):
             yield Static("", id="cab-titulo")
+            yield BotonCabecera("", "toggle_repo", id="cab-toggle", classes="cab-btn")
             yield BotonCabecera("+ nueva", "nueva", id="cab-nueva", classes="cab-btn")
             yield BotonCabecera("⟳", "refrescar", id="cab-refrescar", classes="cab-btn")
         tabla: DataTable = DataTable(id="tabla")
@@ -425,6 +458,7 @@ class ListaScreen(Screen):
         self._pintar_cabecera()
         self.refrescar()
         self.cargar_repos()
+        self.detectar_repo()
         self.set_interval(REFRESCO_SEGUNDOS, self.refrescar)
         self.set_interval(20.0, self._pintar_cabecera)
 
@@ -449,13 +483,37 @@ class ListaScreen(Screen):
         except Exception:  # noqa: BLE001 - sin repos el modal lo dice y sigue
             self.repos = []
 
+    @work(exclusive=True, group="repo-actual")
+    async def detectar_repo(self) -> None:
+        """Modo repo si el cwd cae dentro de uno con remote de GitHub; si no, modo
+        todas en silencio (ver `Backend.repo_actual`)."""
+        try:
+            self.repo_actual = await self.backend.repo_actual()
+        except Exception:  # noqa: BLE001 - cualquier fallo cae en modo todas
+            self.repo_actual = None
+        self.modo_repo = self.repo_actual is not None
+        self.refresh_bindings()
+        self._pintar_tabla()
+
     # ------------------------------------------------------------------ pintado
+    @property
+    def visibles(self) -> list[Tarea]:
+        """`tareas`, filtradas al repo actual cuando el modo repo está activo.
+
+        El filtro es client-side sobre la misma lista del Project; `tareas` sigue
+        siendo el dato completo que trae `backend.listar()`.
+        """
+        if self.modo_repo and self.repo_actual:
+            return [t for t in self.tareas if t.repo == self.repo_actual]
+        return self.tareas
+
     def _pintar_tabla(self) -> None:
         tabla = self.query_one("#tabla", DataTable)
         recordado = tabla.cursor_row
         tabla.clear()
+        visibles = self.visibles
 
-        vacio = not self.tareas
+        vacio = not visibles
         tabla.display = not vacio
         self.query_one("#vacio", Static).display = vacio
         self._pintar_vacio()
@@ -469,7 +527,7 @@ class ListaScreen(Screen):
         disponible = util - ANCHO_VENCE - 3 * relleno
         # La columna de cliente se ajusta al contenido real: si sobra, el hueco se lo
         # queda el título, que es lo que se lee.
-        largo_cliente = max((len(t.cliente) for t in self.tareas), default=ANCHO_CLIENTE_MIN)
+        largo_cliente = max((len(t.cliente) for t in visibles), default=ANCHO_CLIENTE_MIN)
         ancho_cliente = max(
             ANCHO_CLIENTE_MIN, min(ANCHO_CLIENTE_MAX, largo_cliente, disponible // 3)
         )
@@ -480,7 +538,7 @@ class ListaScreen(Screen):
         tabla.columns[claves[2]].width = ancho_titulo
 
         hoy = date.today()
-        for tarea in self.tareas:
+        for tarea in visibles:
             texto, estilo = etiqueta_vencimiento(tarea.vence, hoy)
             tabla.add_row(
                 Text(texto, style=estilo),
@@ -489,7 +547,7 @@ class ListaScreen(Screen):
                 key=tarea.item_id,
             )
         if recordado:
-            tabla.cursor_coordinate = Coordinate(min(recordado, len(self.tareas) - 1), 0)
+            tabla.cursor_coordinate = Coordinate(min(recordado, len(visibles) - 1), 0)
 
     def _pintar_vacio(self) -> None:
         widget = self.query_one("#vacio", Static)
@@ -503,6 +561,13 @@ class ListaScreen(Screen):
                     ("pulsa r o haz clic en ⟳ para reintentar", "dim"),
                 )
             )
+        elif self.modo_repo and self.repo_actual:
+            widget.update(
+                Text.assemble(
+                    (f"✓  sin pendientes en {acortar(self.repo_actual, 40)}\n\n", "bold green"),
+                    ("pulsa t o haz clic en «todas» para ver el resto", "dim"),
+                )
+            )
         else:
             widget.update(
                 Text.assemble(
@@ -512,7 +577,7 @@ class ListaScreen(Screen):
             )
 
     def _pintar_cabecera(self) -> None:
-        cuantas = len(self.tareas)
+        cuantas = len(self.visibles)
         if self.cargando:
             estado = "cargando…"
         elif self.ultimo_error:
@@ -521,8 +586,31 @@ class ListaScreen(Screen):
             estado = "sin pendientes"
         else:
             estado = f"{cuantas} pendiente{'s' if cuantas != 1 else ''}"
+
+        if self.modo_repo and self.repo_actual:
+            etiqueta_titulo = self.repo_actual
+        else:
+            etiqueta_titulo = "tareas de clientes"
+        etiqueta_toggle = "todas" if self.modo_repo else "este repo"
+        toggle = self.query_one("#cab-toggle", BotonCabecera)
+        toggle.display = self.repo_actual is not None
+        toggle.update(Text(etiqueta_toggle))
+
+        # Responsive: el título se trunca con puntos suspensivos antes de invadir a
+        # los botones de la cabecera; el contador de pendientes siempre queda entero.
+        separador = "  ·  "
+        reservado = len("+ nueva") + 2 + len(f"⟳ {self._hace_cuanto()}") + 2
+        if toggle.display:
+            reservado += len(etiqueta_toggle) + 2
+        disponible_titulo = max(6, self.size.width - reservado)
+        disponible_repo = max(3, disponible_titulo - len(separador) - len(estado))
+
         self.query_one("#cab-titulo", Static).update(
-            Text.assemble(("tareas de clientes", "bold"), ("  ·  ", "dim"), (estado, "yellow"))
+            Text.assemble(
+                (acortar(etiqueta_titulo, disponible_repo), "bold"),
+                (separador, "dim"),
+                (estado, "yellow"),
+            )
         )
         self.query_one("#cab-refrescar", BotonCabecera).update(
             Text(f"⟳ {self._hace_cuanto()}", style="dim")
@@ -535,16 +623,23 @@ class ListaScreen(Screen):
         return "recién" if minutos < 1 else f"hace {minutos}m"
 
     def on_resize(self, event: events.Resize) -> None:
-        if self.tareas:
+        self._pintar_cabecera()
+        if self.visibles:
             self.call_after_refresh(self._pintar_tabla)
 
     # ------------------------------------------------------------------ interacción
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "toggle_repo":
+            return self.repo_actual is not None
+        return True
+
     @property
     def seleccionada(self) -> Tarea | None:
-        if not self.tareas:
+        visibles = self.visibles
+        if not visibles:
             return None
         fila = self.query_one("#tabla", DataTable).cursor_row
-        return self.tareas[fila] if 0 <= fila < len(self.tareas) else None
+        return visibles[fila] if 0 <= fila < len(visibles) else None
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         # DataTable ya distingue solo: un clic en otra fila mueve el cursor y un clic
@@ -554,7 +649,12 @@ class ListaScreen(Screen):
 
     def on_boton_cabecera_pulsado(self, event: BotonCabecera.Pulsado) -> None:
         event.stop()
-        self.action_nueva() if event.accion == "nueva" else self.action_refrescar()
+        if event.accion == "nueva":
+            self.action_nueva()
+        elif event.accion == "toggle_repo":
+            self.action_toggle_repo()
+        else:
+            self.action_refrescar()
 
     def action_abajo(self) -> None:
         self.query_one("#tabla", DataTable).action_cursor_down()
@@ -564,6 +664,12 @@ class ListaScreen(Screen):
 
     def action_refrescar(self) -> None:
         self.refrescar()
+
+    def action_toggle_repo(self) -> None:
+        if self.repo_actual is None:
+            return
+        self.modo_repo = not self.modo_repo
+        self._pintar_tabla()
 
     def action_salir(self) -> None:
         self.app.exit()
@@ -599,7 +705,8 @@ class ListaScreen(Screen):
     async def action_nueva(self) -> None:
         if not self.repos:
             self.cargar_repos()
-        datos = await self.app.push_screen_wait(NuevaScreen(self.repos))
+        repo_prefijado = self.repo_actual if self.modo_repo else None
+        datos = await self.app.push_screen_wait(NuevaScreen(self.repos, repo_prefijado))
         if not datos:
             return
         try:

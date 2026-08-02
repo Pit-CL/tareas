@@ -107,6 +107,17 @@ que se abren encima y se cierran con `esc`, con un clic afuera o con su botón.
 
 La lista se recarga sola cada 5 minutos; la cabecera dice hace cuánto se actualizó.
 
+### Modo contextual por repo
+
+Si abres `tareas` parado dentro de un repo con remote de GitHub, la app arranca
+filtrada a ese repo: la cabecera muestra su nombre en vez de «tareas de clientes» y
+la lista solo trae sus tareas. Un clic en «todas» (o la tecla `t`) alterna al listado
+completo y viceversa; fuera de un repo, el toggle no aparece.
+
+Crear una tarea (`n`) en modo repo la preselecciona sin abrir el buscador de
+cliente/repo — solo pide título y fecha. Si igual quieres elegir otro, un clic en la
+etiqueta del repo abre el picker normal.
+
 ### Fechar sin escribir
 
 El diálogo de vencimiento trae atajos clickeables — *hoy*, *mañana*, *+3 días*,
@@ -133,12 +144,14 @@ claro y en oscuro.
 ## Desarrollo
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e .
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 TAREAS_DEMO=1 .venv/bin/python -m tareas_tui     # datos ficticios, sin tocar GitHub
+.venv/bin/pytest                                 # smoke test con el Pilot de textual
 ```
 
 `TAREAS_DEMO=1` levanta la app con tareas de ejemplo y sin llamar a `gh`. Es lo que se
-usa para las capturas de este README.
+usa para las capturas de este README. `BackendDemo(repo_actual="owner/repo")` simula
+además el modo contextual sin tocar GitHub.
 
 El código son tres módulos: `config.py` (configuración y resolución de IDs),
 `datos.py` (llamadas a `gh` y formato) y `app.py` (la interfaz).
