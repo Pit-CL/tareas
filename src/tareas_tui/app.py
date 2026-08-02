@@ -14,6 +14,7 @@ Tres reglas mandan sobre el diseño:
 from __future__ import annotations
 
 import functools
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
 
 from rich.style import Style
@@ -27,14 +28,18 @@ from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
 from textual.widgets import Button, DataTable, Footer, Input, Markdown, OptionList, Static
+from textual.widgets.data_table import CellDoesNotExist
 from textual.widgets.option_list import Option
 
 from .datos import (
     ANCHO_REPEAT,
     ANCHO_VENCE,
+    LIMITE_ITEMS,
     REPETICIONES,
+    SECUNDARIO,
     Backend,
     ErrorGh,
+    ErrorParcial,
     Tarea,
     acortar,
     componer_cuerpo,
@@ -419,6 +424,11 @@ class NuevaScreen(DialogoModal):
     Con `repo_prefijado` (modo repo) el picker arranca oculto y ese repo se muestra
     como una etiqueta clickeable; clickearla lo revela para elegir otro, igual que en
     modo todas.
+
+    Los repos NO llegan por valor sino por `traer_repos`, una corrutina que espera a la
+    carga en curso: recibir la lista de la lista principal la congelaba en el momento de
+    abrir el modal, y como esa carga REASIGNA el atributo, abrir «nueva» antes de que
+    llegaran dejaba el picker vacío para siempre.
     """
 
     BINDINGS = [
@@ -429,9 +439,15 @@ class NuevaScreen(DialogoModal):
         Binding("ctrl+r", "ciclar_repeat", "", show=False, priority=True),
     ]
 
-    def __init__(self, repos: list[str], repo_prefijado: str | None = None) -> None:
+    def __init__(
+        self,
+        traer_repos: Callable[[], Awaitable[list[str]]],
+        repo_prefijado: str | None = None,
+    ) -> None:
         super().__init__()
-        self.repos = repos
+        self._traer_repos = traer_repos
+        self.repos: list[str] = []
+        self.cargando_repos = True
         self.repo_prefijado = repo_prefijado
         self.repo_elegido: str | None = repo_prefijado
         self.repeticion: str = "none"
@@ -474,25 +490,48 @@ class NuevaScreen(DialogoModal):
             self.query_one("#nueva-repos", OptionList).display = False
             self.query_one("#nueva-titulo", Input).focus()
         else:
-            self._pintar_repos(self.repos)
+            self._pintar_repos([])  # placeholder "loading repos…" hasta que lleguen
             self.query_one("#nueva-filtro", Input).focus()
+        self._cargar_repos()
+
+    @work
+    async def _cargar_repos(self) -> None:
+        try:
+            repos = await self._traer_repos()
+        except Exception:  # noqa: BLE001 - sin repos el picker lo dice y sigue
+            repos = []
+        self.cargando_repos = False
+        self.repos = repos
+        # Solo se repinta si el picker está a la vista: con un repo prefijado, pintarlo
+        # borraría el `repo_elegido` que el usuario ya tiene puesto.
+        if self.query_one("#nueva-repos", OptionList).display:
+            self._filtrar()
 
     def on_boton_cabecera_pulsado(self, event: BotonCabecera.Pulsado) -> None:
         if event.accion != "cambiar-repo":
             return
         event.stop()
         self.query_one("#nueva-repo-fijo").remove()
-        self._pintar_repos(self.repos)
         self.query_one("#nueva-filtro", Input).display = True
         self.query_one("#nueva-repos", OptionList).display = True
+        self._filtrar()
         self.query_one("#nueva-filtro", Input).focus()
+
+    def _filtrar(self) -> None:
+        aguja = self.query_one("#nueva-filtro", Input).value.strip().casefold()
+        self._pintar_repos([r for r in self.repos if aguja in r.casefold()])
 
     def _pintar_repos(self, repos: list[str]) -> None:
         lista = self.query_one("#nueva-repos", OptionList)
         lista.clear_options()
         self.repo_elegido = None
         if not repos:
-            lista.add_option(Option("(no matching repos)", disabled=True))
+            lista.add_option(
+                Option(
+                    "loading repos…" if self.cargando_repos else "(no matching repos)",
+                    disabled=True,
+                )
+            )
             return
         lista.add_options([Option(r, id=r) for r in repos])
         lista.highlighted = 0
@@ -520,8 +559,7 @@ class NuevaScreen(DialogoModal):
         if event.input.id != "nueva-filtro":
             return
         event.stop()
-        aguja = event.value.strip().casefold()
-        self._pintar_repos([r for r in self.repos if aguja in r.casefold()])
+        self._filtrar()
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         event.stop()
@@ -575,7 +613,9 @@ class NuevaScreen(DialogoModal):
         notas = self.query_one("#nueva-notas", Input).value.strip()
         fecha = self.query_one("#nueva-fecha", Input).value.strip()
         if not self.repo_elegido:
-            self._avisar("choose a repo from the list")
+            self._avisar(
+                "still loading repos…" if self.cargando_repos else "choose a repo from the list"
+            )
             filtro = self.query_one("#nueva-filtro", Input)
             if filtro.display:
                 filtro.focus()
@@ -677,6 +717,13 @@ class ListaScreen(Screen):
         self.ultimo_ok: datetime | None = None
         self.ultimo_error: str | None = None
         self.cargando = True
+        # item_id -> etiqueta de la escritura en vuelo ("closing…", "saving…"). La fila
+        # sigue en pantalla mientras corren las llamadas a `gh`, así que sin esto un
+        # segundo `x` abría otra confirmación sobre la MISMA tarea y la cerraba dos
+        # veces (`gh issue close` sobre un issue ya cerrado sale 0), duplicando de paso
+        # la siguiente ocurrencia de las repetitivas.
+        self.ocupadas: dict[str, str] = {}
+        self.limite_avisado = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="cabecera"):
@@ -712,6 +759,7 @@ class ListaScreen(Screen):
             self.tareas = await self.backend.listar()
             self.ultimo_ok = datetime.now()
             self.ultimo_error = None
+            self._avisar_limite()
         except Exception as err:  # noqa: BLE001 - cualquier fallo va a la UI, no al log
             self.ultimo_error = str(err)
             self.notify(f"couldn't read the Project: {err}", severity="error", timeout=6)
@@ -719,12 +767,34 @@ class ListaScreen(Screen):
             self.cargando = False
             self._pintar_tabla()
 
+    def _avisar_limite(self) -> None:
+        """Una sola vez por sesión: repetirlo cada 5 minutos sería ruido, no información."""
+        if not self.backend.truncado or self.limite_avisado:
+            return
+        self.limite_avisado = True
+        self.notify(
+            f"the Project returned the full {LIMITE_ITEMS}-item limit: some pending "
+            "tasks may be missing — archive the done ones",
+            severity="warning",
+            timeout=10,
+        )
+
     @work(exclusive=True, group="repos")
     async def cargar_repos(self) -> None:
         try:
             self.repos = await self.backend.repos()
         except Exception:  # noqa: BLE001 - sin repos el modal lo dice y sigue
             self.repos = []
+
+    async def obtener_repos(self) -> list[str]:
+        """Repos del owner, esperando a la carga en curso si todavía no llegaron.
+
+        Es lo que consume `NuevaScreen`: pasarle `self.repos` por valor congelaba una
+        lista vacía si el modal abría antes de que terminara la carga.
+        """
+        if not self.repos:
+            await self.cargar_repos().wait()
+        return self.repos
 
     @work(exclusive=True, group="repo-actual")
     async def detectar_repo(self) -> None:
@@ -752,7 +822,8 @@ class ListaScreen(Screen):
 
     def _pintar_tabla(self) -> None:
         tabla = self.query_one("#tabla", TablaTareas)
-        recordado = tabla.cursor_row
+        recordado = self._item_bajo_cursor(tabla)
+        fila_recordada = tabla.cursor_row
         tabla.clear()
         visibles = self.visibles
 
@@ -782,43 +853,81 @@ class ListaScreen(Screen):
 
         hoy = date.today()
         for tarea in visibles:
-            texto, estilo = etiqueta_vencimiento(tarea.vence, hoy)
+            ocupada = self.ocupadas.get(tarea.item_id)
+            if ocupada:
+                vence = Text(ocupada, style="bold yellow")
+            else:
+                texto, estilo = etiqueta_vencimiento(tarea.vence, hoy)
+                vence = Text(texto, style=estilo)
             tabla.add_row(
-                Text(texto, style=estilo),
+                vence,
                 # En acento y no en dim: una columna de un carácter ya es discreta, y
                 # el dim de esta paleta se queda en 3,98:1 sobre el fondo claro.
                 Text("↻" if tarea.repeat else "", style="yellow"),
-                Text(acortar(tarea.cliente, ancho_cliente), style="dim"),
+                # Color 7 y no dim: el repo se LEE (ver SECUNDARIO).
+                Text(acortar(tarea.cliente, ancho_cliente), style=SECUNDARIO),
                 Text(acortar(tarea.titulo, ancho_titulo)),
                 key=tarea.item_id,
             )
-        if recordado:
-            tabla.cursor_coordinate = Coordinate(min(recordado, len(visibles) - 1), 0)
+        self._reubicar_cursor(tabla, recordado, fila_recordada, visibles)
+
+    @staticmethod
+    def _item_bajo_cursor(tabla: TablaTareas) -> str | None:
+        """item_id de la fila bajo el cursor, leído de la propia tabla.
+
+        No sirve mirar `self.tareas`: para cuando repintamos ya trae el orden nuevo, y
+        la clave de cada fila es justamente el item_id, así que la tabla es la única
+        fuente que todavía describe lo que el usuario tenía seleccionado.
+        """
+        try:
+            return tabla.coordinate_to_cell_key(tabla.cursor_coordinate).row_key.value
+        except CellDoesNotExist:
+            return None
+
+    @staticmethod
+    def _reubicar_cursor(
+        tabla: TablaTareas, item_id: str | None, fila: int, visibles: list[Tarea]
+    ) -> None:
+        """Deja el cursor sobre la MISMA tarea tras repintar.
+
+        `ordenar()` resortea por (vence, título), así que recordar el número de fila
+        dejaba el cursor sobre otra tarea tras fechar una -o tras un refresco de fondo-
+        y un `x` inmediato cerraba la equivocada. Si la tarea ya no está (recién
+        cerrada), el cursor cae en la fila más cercana que siga siendo válida.
+        """
+        destino = fila
+        for indice, tarea in enumerate(visibles):
+            if tarea.item_id == item_id:
+                destino = indice
+                break
+        tabla.cursor_coordinate = Coordinate(max(0, min(destino, len(visibles) - 1)), 0)
 
     def _pintar_vacio(self) -> None:
+        # Todo lo de acá se LEE (es lo único en pantalla), así que va en color 7 y no
+        # en dim (ver SECUNDARIO).
         widget = self.query_one("#vacio", Static)
         if self.cargando:
-            widget.update(Text("loading tasks…", style="dim"))
+            widget.update(Text("loading tasks…", style=SECUNDARIO))
         elif self.ultimo_error:
             widget.update(
                 Text.assemble(
                     ("couldn't read the Project\n", "bold red"),
-                    (f"{acortar(self.ultimo_error, 120)}\n\n", "dim"),
-                    ("press r or click ⟳ to retry", "dim"),
+                    (f"{acortar(self.ultimo_error, 120)}\n\n", SECUNDARIO),
+                    ("press r or click ⟳ to retry", SECUNDARIO),
                 )
             )
         elif self.modo_repo and self.repo_actual:
             widget.update(
                 Text.assemble(
                     (f"✓  nothing pending in {acortar(self.repo_actual, 40)}\n\n", "bold green"),
-                    ('press t or click "all" to see the rest', "dim"),
+                    ('press t or click "all" to see the rest', SECUNDARIO),
                 )
             )
         else:
             widget.update(
                 Text.assemble(
                     ("✓  no pending tasks\n\n", "bold green"),
-                    ('press n or click "+ new" to add one', "dim"),
+                    ('press n or click "+ new" to add one', SECUNDARIO),
                 )
             )
 
@@ -871,8 +980,9 @@ class ListaScreen(Screen):
                 *estado,
             )
         )
+        # El timestamp se consulta de reojo pero se lee: color 7, no dim.
         self.query_one("#cab-refrescar", BotonCabecera).update(
-            Text(f"⟳ {self._hace_cuanto()}", style="dim")
+            Text(f"⟳ {self._hace_cuanto()}", style=SECUNDARIO)
         )
 
     def _hace_cuanto(self) -> str:
@@ -971,10 +1081,10 @@ class ListaScreen(Screen):
 
     @work
     async def action_nueva(self) -> None:
-        if not self.repos:
-            self.cargar_repos()
         repo_prefijado = self.repo_actual if self.modo_repo else None
-        datos = await self.app.push_screen_wait(NuevaScreen(self.repos, repo_prefijado))
+        datos = await self.app.push_screen_wait(
+            NuevaScreen(self.obtener_repos, repo_prefijado)
+        )
         if not datos:
             return
         try:
@@ -984,28 +1094,66 @@ class ListaScreen(Screen):
                 datos["fecha"] or None,
                 componer_cuerpo(datos["notas"], datos["repeat"]),
             )
+        except ErrorParcial as err:
+            # El issue ya existe: decir "couldn't create the task" invita a reintentar y
+            # a terminar con dos. Se refresca para que se vea lo que sí quedó.
+            self.notify(str(err), severity="warning", timeout=10)
+            self.refrescar()
+            return
         except (ErrorGh, IndexError, OSError) as err:
             self.notify(f"couldn't create the task: {err}", severity="error", timeout=6)
             return
         self.notify("task created", timeout=3)
         self.refrescar()
 
+    # ------------------------------------------------------------------ escrituras
+    def _ocupada(self, tarea: Tarea) -> bool:
+        """True si ya hay una escritura en vuelo sobre esa tarea (y se lo dice al usuario)."""
+        etiqueta = self.ocupadas.get(tarea.item_id)
+        if etiqueta is None:
+            return False
+        self.notify(f"already {etiqueta.rstrip('…')} this task", severity="warning", timeout=3)
+        return True
+
+    def _ocupar(self, tarea: Tarea, etiqueta: str) -> None:
+        self.ocupadas[tarea.item_id] = etiqueta
+        self._pintar_tabla()  # la fila muestra la operación en curso donde iba la fecha
+
+    def _liberar(self, tarea: Tarea) -> None:
+        self.ocupadas.pop(tarea.item_id, None)
+        self._pintar_tabla()
+
     async def _fechar(self, tarea: Tarea) -> None:
+        if self._ocupada(tarea):
+            return
         nueva = await self.app.push_screen_wait(FechaScreen(tarea.titulo, tarea.vence))
         if nueva is None:
             return
+        self._ocupar(tarea, "saving…")
         try:
             await self.backend.fechar(tarea.item_id, nueva or None)
         except (ErrorGh, OSError) as err:
             self.notify(f"couldn't update the date: {err}", severity="error", timeout=6)
             return
+        finally:
+            self._liberar(tarea)
         self.notify("due date updated" if nueva else "due date cleared", timeout=3)
         self.refrescar()
 
     async def _cerrar(self, tarea: Tarea) -> None:
+        if self._ocupada(tarea):
+            return
         pregunta = f'close "{acortar(tarea.titulo, 60)}"?'
         if not await self.app.push_screen_wait(ConfirmaScreen(pregunta)):
             return
+        self._ocupar(tarea, "closing…")
+        try:
+            await self._cerrar_ahora(tarea)
+        finally:
+            self._liberar(tarea)
+        self.refrescar()
+
+    async def _cerrar_ahora(self, tarea: Tarea) -> None:
         try:
             await self.backend.cerrar(tarea)
         except (ErrorGh, OSError) as err:
@@ -1014,7 +1162,6 @@ class ListaScreen(Screen):
         self.notify(f"closed {tarea.cliente}", timeout=3)
         if tarea.repeat:
             await self._repetir(tarea)
-        self.refrescar()
 
     async def _repetir(self, tarea: Tarea) -> None:
         """Siguiente ocurrencia de una repetitiva recién cerrada.
@@ -1031,6 +1178,11 @@ class ListaScreen(Screen):
             return
         try:
             proxima = await self.backend.repetir(tarea, date.today())
+        except ErrorParcial as err:
+            # La ocurrencia ya nació, solo que incompleta: decir que no se creó llevaría
+            # al usuario a crearla de nuevo y a duplicar la serie.
+            self.notify(f"closed · ↻ {err}", severity="warning", timeout=10)
+            return
         except (ErrorGh, IndexError, OSError, ValueError) as err:
             self.notify(
                 f"closed, but couldn't create the next occurrence: {err}",
@@ -1084,7 +1236,11 @@ class TareasApp(App):
     .fila-botones { height: 1; width: 100%; }
     /* El error ocupa la fila del hint en vez de sumar una: en 80x15 no sobra ninguna. */
     .error-linea { height: 1; width: 100%; color: $error; display: none; }
-    .hint { height: 1; width: 100%; color: $foreground; text-style: dim; }
+    /* Los hints son accionables: se leen. Van en ansi_white (color 7), que mide 7,38:1
+       en claro y 10,72:1 en oscuro, en vez de "dim", que en esta paleta no pasa de
+       4,0:1. El texto normal (10,24:1 / 12,30:1) sigue por encima, así que la
+       jerarquía se conserva. */
+    .hint { height: 1; width: 100%; color: ansi_white; }
 
     /* Botones de una fila: clickeables sin engordar la UI.
        El color va literal (ansi_yellow/ansi_red/ansi_default) y no por variable: las
@@ -1106,7 +1262,8 @@ class TareasApp(App):
     .fila-chips .chip { margin: 0; }
     .primario { text-style: bold; }
     .peligro { color: ansi_red; }
-    .secundario { color: ansi_default; text-style: dim; }
+    /* Misma razón que .hint: [cancel] y [back] son botones, no decoración. */
+    .secundario { color: ansi_white; }
 
     #det-titulo { height: auto; max-height: 2; text-style: bold; }
     #det-meta { height: 1; color: $accent; }
@@ -1136,6 +1293,15 @@ class TareasApp(App):
         border-left: solid ansi_yellow;
     }
     #nueva-fecha, #fecha-input { max-width: 24; }
+
+    /* Los placeholders dicen QUÉ va en cada campo: se leen. El theme ansi de Textual
+       los pinta con `text-style: dim` sobre ansi_default (ver Input.DEFAULT_CSS, rama
+       `&:ansi`), que es el mismo problema de contraste del resto: en claro quedaban en
+       2,7:1. Color 7 y sin dim, igual que los hints. */
+    Input > .input--placeholder, Input > .input--suggestion {
+        color: ansi_white;
+        text-style: none;
+    }
     """
 
     def __init__(self, backend: Backend) -> None:

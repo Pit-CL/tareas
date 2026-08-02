@@ -1,0 +1,23 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # La suite corre entera contra `BackendDemo` y un `gh` de mentira: no necesita
+      # el GitHub CLI instalado, ni credenciales, ni red.
+      - run: pip install -e ".[dev]"
+      - run: pytest

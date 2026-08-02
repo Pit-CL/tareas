@@ -32,7 +32,8 @@ the opposite:
 - **Recurring tasks.** Mark a task as daily, weekly, biweekly or monthly and
   closing it opens the next occurrence automatically.
 - **Auto-refresh.** The list reloads itself every 5 minutes; the header shows how
-  long ago it last synced.
+  long ago it last synced. Every `gh` call gives up after 30 seconds, so a dead
+  network shows an error you can retry instead of a spinner that never ends.
 - **Uses your terminal's colors.** No hardcoded palette — it inherits yours, so if
   your terminal switches between light and dark, the app switches with it.
 
@@ -141,7 +142,18 @@ protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) (kitty, WezTerm,
 Ghostty, foot…). `ctrl+s` does the same thing everywhere else.
 
 The list reloads itself every 5 minutes; the header shows how long ago it last
-updated.
+updated. The selection follows the *task*, not the row number: when a reload
+re-sorts the list — after you change a due date, say — the cursor stays on whatever
+you had selected, so an immediate `x` never closes the wrong thing.
+
+While a task is being closed or saved its row says so (`closing…` / `saving…`)
+where the due date goes, and it ignores a second `x` until the first one is done —
+one keystroke, one issue closed.
+
+The app reads up to 1000 items from the Project. GitHub applies that limit *before*
+the done ones are filtered out, so if you ever hit it the app says so and asks you
+to archive the completed ones; a Project that never gets archived would otherwise
+start hiding pending tasks with no warning.
 
 ### Contextual repo mode
 
@@ -214,16 +226,27 @@ When nothing is left pending, it says so:
 
 The app defines a theme with `ansi=True`, so its colors are your terminal's **own
 ANSI 0-15 colors**: the background and text are yours, and status colors use the
-semantic slots (red for overdue, yellow for due soon, dim for the rest). That's
-why the screenshots above look different from each other — it's the same code
-over different palettes — and why there's nothing to configure to make it look
-right in light or dark.
+semantic slots (red for overdue, yellow for due soon). That's why the screenshots
+above look different from each other — it's the same code over different palettes —
+and why there's nothing to configure to make it look right in light or dark.
 
-The one place that needs care is the row under the cursor, which paints text in
-color 0 over color 3. Textual's `cursor_foreground_priority` only overrides the
-*color* of a cell, never its attributes, so a cell marked `dim` kept fading
-against the cursor's background until it was unreadable. `TablaTareas` cancels
-`dim` on that row, so it reads as one solid block.
+Secondary text that you actually *read* — distant and missing due dates, the repo
+column, the hints, the sync timestamp, the field placeholders, the `[cancel]`
+buttons — uses **color 7**, not `dim`. `dim` is rendered by blending the text into
+the background, which drops it to 2.7:1 on light and 4.0:1 on dark; color 7
+measures 7.38:1 on light and 10.72:1 on dark while still sitting below normal text
+(10.24:1 / 12.30:1), so the hierarchy survives and the text stays legible. `dim` is
+kept only for the decorative `·` separators in the header.
+
+The due date column is the one that earns the most from this, since it's the whole
+point of the row. It reads as four steps: **overdue** (bold red) → **today** (bold
+amber) → **due soon** (amber) → **far off or undated** (color 7).
+
+The row under the cursor paints text in color 0 over color 3. Textual's
+`cursor_foreground_priority` only overrides the *color* of a cell, never its
+attributes, so a cell marked `dim` used to keep fading against the cursor's
+background until it was unreadable. Nothing ships `dim` any more, but `TablaTareas`
+still cancels it on that row so the problem can't come back in through a new cell.
 
 ## Running in a persistent pane
 
@@ -249,7 +272,11 @@ also simulates contextual repo mode without touching GitHub.
 The code is three modules: `config.py` (configuration and ID resolution),
 `datos.py` (`gh` calls, date math and formatting), and `app.py` (the interface).
 Tests are split the same way: `tests/test_repeticion.py` covers the recurrence
-math on its own, `tests/test_app.py` drives the interface with textual's Pilot.
+math on its own, `tests/test_backend.py` covers the `gh` layer (timeouts, orphaned
+subprocesses, partial writes, the item limit) against a fake `gh`, and
+`tests/test_app.py` drives the interface with textual's Pilot. The whole suite runs
+without the GitHub CLI installed and without credentials or network, which is what
+CI does on Python 3.11 and 3.12.
 
 > **Note:** the interface currently ships in English; the dates and data you'll
 > see when you run it come straight from your own GitHub Project.
