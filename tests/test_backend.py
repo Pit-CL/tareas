@@ -242,3 +242,127 @@ async def test_listar_no_marca_truncado_cuando_sobra_margen(monkeypatch):
 
 async def test_el_limite_por_defecto_deja_margen_de_sobra():
     assert datos.LIMITE_ITEMS >= 1000
+
+
+# ------------------------------------------------------------------ campo renombrado
+def _items_con_clave(clave: str) -> str:
+    return json.dumps(
+        {
+            "items": [
+                {
+                    "id": "PVTI_1",
+                    "status": "Todo",
+                    "content": {
+                        "type": "Issue",
+                        "repository": "pit/web",
+                        "number": 1,
+                        "title": "Renew SSL",
+                        "url": "https://github.com/pit/web/issues/1",
+                        "body": "",
+                    },
+                    clave: "2026-09-01",
+                }
+            ]
+        }
+    )
+
+
+def _gh_campo(clave_items: str, campos: list[dict] | None = None, falla_field_list=False):
+    """`gh` de mentira: los items traen la fecha bajo `clave_items` y el Project
+    declara `campos` (lo que devolvería `gh project field-list`)."""
+    usados: list[tuple[str, ...]] = []
+
+    async def falso(*args: str) -> str:
+        usados.append(args)
+        if args[:2] == ("project", "item-list"):
+            return _items_con_clave(clave_items)
+        if args[:2] == ("project", "field-list"):
+            if falla_field_list:
+                raise ErrorGh("HTTP 502")
+            return json.dumps({"fields": campos or []})
+        return ""
+
+    return falso, usados
+
+
+async def test_renombrar_el_campo_de_fecha_deja_de_ser_silencioso(monkeypatch):
+    """Antes: el campo se renombraba en GitHub, `valor_campo` no encontraba la clave y
+    TODAS las tareas llegaban con vence=None sin un solo aviso. Ahora se desempata por
+    id -lo único que un rename no cambia-, se leen las fechas igual y se avisa."""
+    falso, usados = _gh_campo(
+        "fecha vencimiento",
+        campos=[{"id": "PVTF_test", "name": "Fecha vencimiento", "type": "ProjectV2Field"}],
+    )
+    monkeypatch.setattr(datos, "gh", falso)
+    backend = Backend(CONFIG)
+    tareas = await backend.listar()
+
+    from datetime import date
+
+    assert tareas[0].vence == date(2026, 9, 1), "la fecha se perdió pese a estar en GitHub"
+    assert backend.aviso_campo is not None
+    assert "renamed" in backend.aviso_campo
+    assert '"Fecha vencimiento"' in backend.aviso_campo
+    assert any(a[:2] == ("project", "field-list") for a in usados)
+
+
+async def test_borrar_el_campo_de_fecha_avisa_en_vez_de_callar(monkeypatch):
+    falso, _ = _gh_campo(
+        "otra cosa",
+        campos=[{"id": "PVTF_distinto", "name": "Sprint", "type": "ProjectV2Field"}],
+    )
+    monkeypatch.setattr(datos, "gh", falso)
+    backend = Backend(CONFIG)
+    tareas = await backend.listar()
+
+    assert tareas[0].vence is None  # no hay nada que leer, pero ya no es en silencio
+    assert backend.aviso_campo is not None
+    assert "is gone" in backend.aviso_campo
+    assert "Sprint" in backend.aviso_campo  # dice qué campos hay ahora
+
+
+async def test_un_project_sin_vencimientos_puestos_no_dispara_ningun_aviso(monkeypatch):
+    """El caso legítimo: el campo existe y se llama igual, solo que nadie lo usó."""
+    falso, _ = _gh_campo(
+        "otra cosa",
+        campos=[{"id": "PVTF_test", "name": "Due date", "type": "ProjectV2Field"}],
+    )
+    monkeypatch.setattr(datos, "gh", falso)
+    backend = Backend(CONFIG)
+    await backend.listar()
+
+    assert backend.aviso_campo is None
+
+
+async def test_si_no_se_puede_comprobar_el_campo_no_se_inventa_un_aviso(monkeypatch):
+    falso, _ = _gh_campo("otra cosa", falla_field_list=True)
+    monkeypatch.setattr(datos, "gh", falso)
+    backend = Backend(CONFIG)
+    await backend.listar()
+
+    assert backend.aviso_campo is None
+
+
+async def test_el_campo_se_sondea_una_sola_vez_por_proceso(monkeypatch):
+    """El refresco corre cada 5 minutos: repetir el `field-list` sería una llamada de
+    red periódica para volver a saber lo mismo."""
+    falso, usados = _gh_campo(
+        "otra cosa",
+        campos=[{"id": "PVTF_test", "name": "Due date", "type": "ProjectV2Field"}],
+    )
+    monkeypatch.setattr(datos, "gh", falso)
+    backend = Backend(CONFIG)
+    await backend.listar()
+    await backend.listar()
+    await backend.listar()
+
+    assert sum(1 for a in usados if a[:2] == ("project", "field-list")) == 1
+
+
+async def test_el_camino_normal_no_pregunta_por_los_campos(monkeypatch):
+    """Con la fecha presente en los items no hay nada que sospechar: cero red extra."""
+    falso, usados = _gh_campo("due date", campos=[])
+    monkeypatch.setattr(datos, "gh", falso)
+    await Backend(CONFIG).listar()
+
+    assert not any(a[:2] == ("project", "field-list") for a in usados)

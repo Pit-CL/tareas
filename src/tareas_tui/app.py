@@ -49,6 +49,7 @@ from .datos import (
     mas_un_mes,
     ordenar,
     parsear_fecha,
+    proxima_fecha,
 )
 
 REFRESCO_SEGUNDOS = 300.0
@@ -732,11 +733,16 @@ class ListaScreen(Screen):
         # la siguiente ocurrencia de las repetitivas.
         self.ocupadas: dict[str, str] = {}
         self.limite_avisado = False
-        # item_ids cerrados en esta sesión que el Project todavía puede devolver como
+        # item_ids cerrados desde acá que el Project todavía puede devolver como
         # pendientes: el Status "Done" lo pone un workflow de Projects DESPUÉS de que
         # `gh issue close` vuelve, así que el refresco inmediato llega a destiempo y
         # resucitaría la fila que el usuario acaba de ver desaparecer.
+        #
+        # Se persiste con el caché (no solo en memoria): al vivir únicamente en el
+        # proceso, reiniciar la app resucitaba la tarea desde el caché de disco y
+        # cerrarla de nuevo creaba una SEGUNDA ocurrencia de la repetitiva en GitHub.
         self.cerradas: set[str] = set()
+        self.aviso_campo_dado = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="cabecera"):
@@ -777,7 +783,11 @@ class ListaScreen(Screen):
         guardado = self.backend.instantanea()
         if guardado.tareas is None:
             return
-        self.tareas = guardado.tareas
+        # El filtro de cerradas se aplica ANTES de pintar: el caché se escribió con la
+        # lista cruda del Project, que sigue trayendo lo que cerramos hasta que su
+        # workflow voltea el Status.
+        self.cerradas = set(guardado.cerradas)
+        self.tareas = [t for t in guardado.tareas if t.item_id not in self.cerradas]
         self.ultimo_ok = guardado.momento
         self.repos = guardado.repos
         if guardado.repo_actual:
@@ -795,17 +805,38 @@ class ListaScreen(Screen):
             llegadas = await self.backend.listar()
             # Se recuerdan solo las que el Project sigue devolviendo: en cuanto deja de
             # mandarlas el filtro sobra y el set se vacía solo, sin caducidad inventada.
+            previas = set(self.cerradas)
             self.cerradas &= {t.item_id for t in llegadas}
+            if self.cerradas != previas:  # el refresco corre cada 5 min: no reescribir por nada
+                self._recordar_cerradas()
             self.tareas = [t for t in llegadas if t.item_id not in self.cerradas]
             self.ultimo_ok = datetime.now()
             self.ultimo_error = None
             self._avisar_limite()
+            self._avisar_campo()
         except Exception as err:  # noqa: BLE001 - cualquier fallo va a la UI, no al log
             self.ultimo_error = str(err)
             self.notify(f"couldn't read the Project: {err}", severity="error", timeout=6)
         finally:
             self.cargando = False
             self._pintar_tabla()
+
+    def _recordar_cerradas(self) -> None:
+        """Baja el set de cerradas al disco, junto al caché de la lista."""
+        self.backend.recordar_cerradas(self.cerradas)
+
+    def _avisar_campo(self) -> None:
+        """Rompe el silencio cuando el campo de fecha ya no se llama como dice la config.
+
+        Sin esto la app pintaba TODAS las tareas como «no due date» y no había forma
+        de distinguirlo de un Project sin vencimientos puestos. Va como error y una
+        sola vez por sesión: en cada refresco sería ruido.
+        """
+        aviso = self.backend.aviso_campo
+        if not aviso or self.aviso_campo_dado:
+            return
+        self.aviso_campo_dado = True
+        self.notify(aviso, severity="error", timeout=15)
 
     def _avisar_limite(self) -> None:
         """Una sola vez por sesión: repetirlo cada 5 minutos sería ruido, no información."""
@@ -1103,6 +1134,7 @@ class ListaScreen(Screen):
         # El refresco a mano es la vía de escape si una tarea se reabrió en GitHub
         # después de cerrarla acá: deja de ocultarse y vuelve a la lista.
         self.cerradas.clear()
+        self._recordar_cerradas()
         self.refrescar()
 
     def action_toggle_repo(self) -> None:
@@ -1241,6 +1273,7 @@ class ListaScreen(Screen):
             self.notify(f"couldn't close the task: {err}", severity="error", timeout=6)
             return
         self.cerradas.add(tarea.item_id)
+        self._recordar_cerradas()
         self._aplicar([t for t in self.tareas if t.item_id != tarea.item_id])
         self.notify(f"closed {tarea.cliente}", timeout=3)
         if tarea.repeat:
@@ -1252,6 +1285,24 @@ class ListaScreen(Screen):
         El cierre ya ocurrió: si esto falla hay que decirlo fuerte, o la serie se corta
         en silencio y el usuario recién se entera cuando la tarea no vuelve.
         """
+        if tarea.repeat and tarea.vence is not None:
+            # Segunda red de seguridad contra la ocurrencia duplicada: si la que
+            # tocaba crear ya está en la lista, no se crea otra. Cubre cerrar dos
+            # veces la misma tarea repetitiva -por un fantasma del caché, por haberla
+            # reabierto en GitHub o por dos instancias de la app abiertas-, que dejaba
+            # dos issues con la MISMA fecha y sin forma de saber cuál sobra.
+            proxima = proxima_fecha(tarea.vence, tarea.repeat, date.today())
+            if any(
+                t.item_id != tarea.item_id
+                and t.repo == tarea.repo
+                and t.titulo == tarea.titulo
+                and t.vence == proxima
+                for t in self.tareas
+            ):
+                self.notify(
+                    f"↻ next occurrence already exists ({proxima.isoformat()})", timeout=4
+                )
+                return
         if tarea.vence is None:
             self.notify(
                 "↻ no due date on this task: next occurrence not created",

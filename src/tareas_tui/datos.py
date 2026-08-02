@@ -55,6 +55,12 @@ LIMITE_ITEMS = 1000
 # Intervalos de repetición, en el orden en que los cicla el chip del modal.
 REPETICIONES: tuple[str, ...] = ("none", "daily", "weekly", "biweekly", "monthly")
 
+# Cuánto se recuerda -en disco- que una tarea se cerró desde acá. El workflow de
+# Projects que pone Status=Done corre segundos después de `gh issue close`, así que
+# un día es techo de sobra; sirve para que un item_id no quede escondido para
+# siempre si el Project dejara de devolverlo por cualquier otra razón.
+VIDA_CERRADAS = timedelta(days=1)
+
 # La repetición viaja en el propio cuerpo del issue como comentario HTML: GitHub no
 # lo muestra al renderizar el markdown, así que el usuario ve solo sus notas y no
 # hace falta ningún campo extra en el Project.
@@ -259,6 +265,9 @@ class Instantanea:
     momento: datetime | None = None
     repos: list[str] = field(default_factory=list)
     repo_actual: str | None = None
+    #: item_ids cerrados desde la app que el Project todavía puede devolver como
+    #: pendientes. Sin esto el caché los resucitaba en el próximo arranque.
+    cerradas: set[str] = field(default_factory=set)
 
 
 def _tarea_a_dict(tarea: Tarea) -> dict:
@@ -327,6 +336,17 @@ class Backend:
     #: La última lectura tocó `LIMITE_ITEMS`: puede haber pendientes fuera de la lista.
     truncado = False
 
+    #: Mensaje si el campo de fecha configurado ya no aparece con ese nombre en el
+    #: Project. La lectura "funcionaba" igual, con TODOS los vencimientos vacíos: esa
+    #: es justo la falla silenciosa que esto viene a romper. Lo consume la UI.
+    aviso_campo: str | None = None
+
+    #: El sondeo del campo se hace una vez por proceso: solo se dispara cuando ningún
+    #: item trae la columna, y repetirlo en cada refresco sería una llamada de red
+    #: cada 5 minutos para volver a saber lo mismo.
+    _campo_probado = False
+    _campo_actual: str | None = None
+
     def __init__(self, config: Config) -> None:
         self.config = config
 
@@ -362,7 +382,82 @@ class Backend:
             momento=_momento_de(guardado.get("momento")),
             repos=[str(r) for r in repos] if isinstance(repos, list) else [],
             repo_actual=repo_actual,
+            cerradas=self._cerradas_vigentes(guardado.get("cerradas")),
         )
+
+    @staticmethod
+    def _cerradas_vigentes(crudo: object) -> set[str]:
+        """Cerradas guardadas que todavía valen; las de más de `VIDA_CERRADAS` caducan.
+
+        Una marca sin fecha legible se descarta: esconder una tarea para siempre por
+        un timestamp corrupto sería peor que mostrarla de más.
+        """
+        if not isinstance(crudo, dict):
+            return set()
+        limite = datetime.now() - VIDA_CERRADAS
+        vigentes: set[str] = set()
+        for item_id, cuando in crudo.items():
+            momento = _momento_de(cuando)
+            if momento is not None and momento > limite:
+                vigentes.add(str(item_id))
+        return vigentes
+
+    def recordar_cerradas(self, ids: set[str]) -> None:
+        """Persiste qué tareas se cerraron desde acá, conservando su fecha original.
+
+        `ids` es el set completo: lo que no venga se olvida. Así el mismo llamado
+        sirve para anotar un cierre nuevo y para podar las que el Project ya dejó de
+        devolver, sin dos caminos que puedan desincronizarse.
+        """
+        ahora = datetime.now().isoformat(timespec="seconds")
+        guardado = cache.leer(self._clave_cache).get("cerradas")
+        previas = guardado if isinstance(guardado, dict) else {}
+        self._cachear(cerradas={str(i): previas.get(i, ahora) for i in ids})
+
+    async def _nombre_del_campo(self, items: list[dict]) -> str:
+        """Nombre bajo el que `gh` aplana el campo de fecha en estos items.
+
+        Casi siempre es el de la config y no cuesta nada. Si no aparece en NINGÚN
+        item hay dos explicaciones posibles: que nadie tenga vencimiento puesto, o
+        que el campo se haya renombrado en GitHub -y entonces la app pintaba todo
+        «no due date» sin decir una palabra-. Solo en ese caso se preguntan los
+        campos del Project y se desempata por **id**, que es lo único que un rename
+        no cambia: si el campo sigue ahí con otro nombre se usa el nuevo y se avisa.
+        """
+        nombre = self.config.campo_fecha
+        if self._campo_probado:
+            return self._campo_actual or nombre
+        if not items or any(valor_campo(item, nombre) is not None for item in items):
+            return nombre
+
+        self._campo_probado = True
+        try:
+            crudo = await gh(
+                "project", "field-list", self.config.project, "--owner", self.config.owner,
+                "--format", "json", "--limit", "50",
+            )
+            campos = json.loads(crudo or "{}").get("fields", [])
+        except (ErrorGh, OSError, json.JSONDecodeError):
+            return nombre  # sin poder comprobarlo no se inventa un aviso
+
+        por_id = next((c for c in campos if c.get("id") == self.config.campo_fecha_id), None)
+        if por_id is None:
+            nombres = ", ".join(str(c.get("name", "?")) for c in campos) or "(none)"
+            self.aviso_campo = (
+                f'the date field "{nombre}" is gone from the Project, so every task '
+                f"shows up with no due date. Fields now: {nombres}"
+            )
+            return nombre
+
+        actual = str(por_id.get("name") or nombre)
+        if actual.replace(" ", "").casefold() != nombre.replace(" ", "").casefold():
+            self.aviso_campo = (
+                f'the date field was renamed on GitHub: "{nombre}" is now "{actual}". '
+                f"Reading it by id for now — update campo_fecha in your config file."
+            )
+            self._campo_actual = actual
+            return actual
+        return nombre  # el campo está y se llama igual: nadie tiene vencimiento puesto
 
     async def listar(self) -> list[Tarea]:
         cfg = self.config
@@ -374,6 +469,7 @@ class Backend:
         # Se cuenta ANTES de filtrar: el límite lo aplica GitHub sobre el Project entero,
         # hechas incluidas, así que tocar el techo puede estar escondiendo pendientes.
         self.truncado = len(items) >= LIMITE_ITEMS
+        campo = await self._nombre_del_campo(items)
         tareas: list[Tarea] = []
         for item in items:
             if str(item.get("status", "")).casefold() == cfg.estado_hecho.casefold():
@@ -390,7 +486,7 @@ class Backend:
                     titulo=(contenido.get("title") or item.get("title") or "(untitled)").strip(),
                     url=contenido.get("url", ""),
                     cuerpo=cuerpo,
-                    vence=parsear_fecha(valor_campo(item, cfg.campo_fecha)),
+                    vence=parsear_fecha(valor_campo(item, campo)),
                     repeat=repeat,
                 )
             )
@@ -564,6 +660,11 @@ class BackendDemo(Backend):
         return Instantanea()
 
     def _cachear(self, **campos) -> None:
+        return None
+
+    def recordar_cerradas(self, ids: set[str]) -> None:
+        # No solo por no cachear: `Backend.recordar_cerradas` necesita `self.config`,
+        # que la demo no tiene (nunca llama a `super().__init__`).
         return None
 
     async def listar(self) -> list[Tarea]:
