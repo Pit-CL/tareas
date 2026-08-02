@@ -38,7 +38,16 @@ async def test_modo_todas_sin_repo_detectado():
         assert screen.modo_repo is False
         assert len(screen.visibles) == len(screen.tareas) == 7
         assert screen.query_one("#cab-toggle").display is False
-        assert screen.query_one("#cab-titulo").content.plain.startswith("tareas de clientes")
+        assert screen.query_one("#cab-titulo").content.plain.startswith("Client Tasks")
+
+
+async def test_modo_todas_usa_el_titulo_del_project_del_backend():
+    # El header en modo todas muestra `backend.titulo_project` (el nombre real del
+    # GitHub Project cuando el backend es real), no un string fijo.
+    app = TareasApp(BackendDemo(project_title="Ops Board"))
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        assert screen.query_one("#cab-titulo").content.plain.startswith("Ops Board")
 
 
 async def test_modo_repo_detectado_filtra_la_lista():
@@ -138,8 +147,8 @@ async def test_vacio_en_modo_repo_muestra_hint_del_toggle():
     async with app.run_test() as pilot:
         screen = await _listo(pilot)
         texto = screen.query_one("#vacio").content.plain
-        assert "sin pendientes en vela/landing" in texto
-        assert "todas" in texto
+        assert "nothing pending in vela/landing" in texto
+        assert "all" in texto
 
 
 async def test_vacio_en_modo_todas_sin_cambios():
@@ -147,7 +156,7 @@ async def test_vacio_en_modo_todas_sin_cambios():
     async with app.run_test() as pilot:
         screen = await _listo(pilot)
         texto = screen.query_one("#vacio").content.plain
-        assert "sin tareas pendientes" in texto
+        assert "no pending tasks" in texto
 
 
 # ------------------------------------------------------------------ pane chico / responsive

@@ -29,7 +29,7 @@ async def gh(*args: str) -> str:
     salida, error = await proc.communicate()
     if proc.returncode != 0:
         detalle = error.decode("utf-8", "replace").strip().splitlines()
-        raise ErrorGh(detalle[-1][:200] if detalle else f"gh salió con {proc.returncode}")
+        raise ErrorGh(detalle[-1][:200] if detalle else f"gh exited with {proc.returncode}")
     return salida.decode("utf-8", "replace")
 
 
@@ -59,35 +59,35 @@ def parsear_fecha(valor: str | None) -> date | None:
         return None
 
 
-# ------------------------------------------------------------------ formato (es-419)
+# ------------------------------------------------------------------ format (en)
 def etiqueta_vencimiento(vence: date | None, hoy: date) -> tuple[str, str]:
     """Devuelve (texto, estilo rich). Máximo ANCHO_VENCE caracteres."""
     if vence is None:
         return "—", "dim"
     dias = (vence - hoy).days
     if dias < 0:
-        return f"hace {-dias}d"[:ANCHO_VENCE], "bold red"
+        return f"{-dias}d ago"[:ANCHO_VENCE], "bold red"
     if dias == 0:
-        return "hoy", "bold yellow"
+        return "today", "bold yellow"
     if dias == 1:
-        return "mañana", "yellow"
+        return "tomorrow", "yellow"
     if dias <= 7:
-        return f"en {dias}d", "yellow"
-    return f"en {dias}d"[:ANCHO_VENCE], "dim"
+        return f"in {dias}d", "yellow"
+    return f"in {dias}d"[:ANCHO_VENCE], "dim"
 
 
 def fecha_larga(vence: date | None, hoy: date) -> str:
     if vence is None:
-        return "sin fecha de vencimiento"
+        return "no due date"
     dias = (vence - hoy).days
     if dias < 0:
-        cola = f"atrasada por {-dias} día{'s' if -dias != 1 else ''}"
+        cola = f"{-dias} day{'s' if -dias != 1 else ''} overdue"
     elif dias == 0:
-        cola = "vence hoy"
+        cola = "due today"
     elif dias == 1:
-        cola = "vence mañana"
+        cola = "due tomorrow"
     else:
-        cola = f"faltan {dias} días"
+        cola = f"{dias} days left"
     return f"{vence.strftime('%d-%m-%Y')} · {cola}"
 
 
@@ -110,6 +110,10 @@ class Backend:
     def __init__(self, config: Config) -> None:
         self.config = config
 
+    @property
+    def titulo_project(self) -> str:
+        return self.config.project_title
+
     async def listar(self) -> list[Tarea]:
         cfg = self.config
         crudo = await gh(
@@ -128,7 +132,7 @@ class Backend:
                     item_id=item.get("id", ""),
                     repo=contenido.get("repository", ""),
                     numero=int(contenido.get("number", 0)),
-                    titulo=(contenido.get("title") or item.get("title") or "(sin título)").strip(),
+                    titulo=(contenido.get("title") or item.get("title") or "(untitled)").strip(),
                     url=contenido.get("url", ""),
                     cuerpo=(contenido.get("body") or "").strip(),
                     vence=parsear_fecha(valor_campo(item, cfg.campo_fecha)),
@@ -202,23 +206,24 @@ def ordenar(tareas: list[Tarea]) -> list[Tarea]:
 
 
 _DEMO = (
-    (31, "vela/landing", "Subir las fotos nuevas de la portada", -8),
-    (12, "acme/web", "Renovar hosting y certificado SSL", -3),
-    (48, "lumen/tienda", "Cambiar el flujo de pago del checkout", 0),
-    (7, "nordic/erp", "Exportar las facturas del mes a XML", 2),
-    (3, "vela/landing", "Ajustar los textos de la portada", 5),
-    (21, "korta/api", "Migrar los webhooks a la versión 2", 19),
-    (9, "mesa/intranet", "Revisar permisos por rol de usuario", None),
+    (31, "vela/landing", "Upload the new homepage photos", -8),
+    (12, "acme/web", "Renew hosting and SSL certificate", -3),
+    (48, "lumen/shop", "Change the checkout payment flow", 0),
+    (7, "nordic/erp", "Export this month's invoices to XML", 2),
+    (3, "vela/landing", "Tweak the homepage copy", 5),
+    (21, "korta/api", "Migrate webhooks to version 2", 19),
+    (9, "mesa/intranet", "Review permissions by user role", None),
 )
 
 
 class BackendDemo(Backend):
     """Datos ficticios: alimenta las capturas del README y las pruebas."""
 
-    def __init__(self, repo_actual: str | None = None) -> None:
+    def __init__(self, repo_actual: str | None = None, project_title: str = "Client Tasks") -> None:
         """`repo_actual` simula estar parado en ese repo (modo repo en la demo)."""
         hoy = date.today()
         self._repo_actual = repo_actual
+        self._project_title = project_title
         self._tareas = ordenar(
             [
                 Tarea(
@@ -227,18 +232,22 @@ class BackendDemo(Backend):
                     numero=numero,
                     titulo=titulo,
                     url=f"https://example.com/{repo}/issues/{numero}",
-                    cuerpo=f"Pedido de ejemplo para la demo.\n\n- Detalle uno\n- Detalle dos",
+                    cuerpo="Sample request for the demo.\n\n- Detail one\n- Detail two",
                     vence=None if dias is None else hoy + timedelta(days=dias),
                 )
                 for numero, repo, titulo, dias in _DEMO
             ]
         )
 
+    @property
+    def titulo_project(self) -> str:
+        return self._project_title
+
     async def listar(self) -> list[Tarea]:
         return list(self._tareas)
 
     async def repos(self) -> list[str]:
-        return ["acme/web", "korta/api", "lumen/tienda", "mesa/intranet", "vela/landing"]
+        return ["acme/web", "korta/api", "lumen/shop", "mesa/intranet", "vela/landing"]
 
     async def repo_actual(self) -> str | None:
         return self._repo_actual
@@ -254,7 +263,7 @@ class BackendDemo(Backend):
                     numero=numero,
                     titulo=titulo,
                     url=f"https://example.com/{repo}/issues/{numero}",
-                    cuerpo="Creada en la demo.",
+                    cuerpo="Created in the demo.",
                     vence=parsear_fecha(fecha),
                 ),
             ]

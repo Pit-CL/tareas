@@ -39,20 +39,20 @@ def ruta_cache() -> Path:
 EJEMPLO = """\
 # ~/.config/tareas/config.toml
 
-# Usuario u organización dueña del GitHub Project (v2).
-owner = "mi-usuario"
+# GitHub user or organization that owns the Project (v2).
+owner = "my-user"
 
-# Número del Project; es el que aparece al final de su URL.
+# Project number; it's the one at the end of its URL.
 project = 1
 
-# Nombre del campo de tipo Date que marca el vencimiento.
-campo_fecha = "Vencimiento"
+# Name of the Date-type field that marks the due date.
+campo_fecha = "Due date"
 
-# Nombre de la opción de Status que cuenta como terminada.
+# Name of the Status option that counts as done.
 estado_hecho = "Done"
 
-# Cuerpo que se le pone al issue cuando lo creas desde la TUI.
-cuerpo_nuevo = "Creada desde la TUI de tareas."
+# Body text set on the issue when you create it from the TUI.
+cuerpo_nuevo = "Created from the tareas TUI."
 """
 
 
@@ -65,23 +65,24 @@ class Config:
     cuerpo_nuevo: str
     project_id: str
     campo_fecha_id: str
+    project_title: str
 
 
 def _leer_toml() -> dict:
     ruta = ruta_config()
     if tomllib is None:
-        raise ErrorConfig("tareas necesita Python 3.11 o superior (usa tomllib).")
+        raise ErrorConfig("tareas needs Python 3.11 or higher (uses tomllib).")
     if not ruta.is_file():
         raise ErrorConfig(
-            f"no encontré {ruta}.\n\n"
-            "Crea ese archivo con este contenido y ajusta los valores:\n\n"
+            f"I couldn't find {ruta}.\n\n"
+            "Create that file with this content and adjust the values:\n\n"
             f"{EJEMPLO}"
         )
     try:
         with ruta.open("rb") as fh:
             return tomllib.load(fh)
     except tomllib.TOMLDecodeError as err:
-        raise ErrorConfig(f"{ruta} no es TOML válido: {err}") from err
+        raise ErrorConfig(f"{ruta} is not valid TOML: {err}") from err
 
 
 def _gh(*args: str) -> str:
@@ -90,32 +91,33 @@ def _gh(*args: str) -> str:
             ["gh", *args], capture_output=True, text=True, timeout=30, check=False
         )
     except FileNotFoundError as err:
-        raise ErrorConfig("no encontré el comando `gh` (instala GitHub CLI).") from err
+        raise ErrorConfig("I couldn't find the `gh` command (install GitHub CLI).") from err
     except subprocess.TimeoutExpired as err:
-        raise ErrorConfig("`gh` no respondió a tiempo.") from err
+        raise ErrorConfig("`gh` didn't respond in time.") from err
     if proc.returncode != 0:
         detalle = (proc.stderr or "").strip().splitlines()
-        raise ErrorConfig(detalle[-1] if detalle else f"`gh` falló ({proc.returncode}).")
+        raise ErrorConfig(detalle[-1] if detalle else f"`gh` failed ({proc.returncode}).")
     return proc.stdout
 
 
-def _resolver_ids(owner: str, project: str, campo_fecha: str) -> tuple[str, str]:
-    """Pregunta a gh por el id del Project y el del campo de fecha."""
+def _resolver_ids(owner: str, project: str, campo_fecha: str) -> tuple[str, str, str]:
+    """Pregunta a gh por el id del Project, el del campo de fecha y el título del Project."""
     vista = json.loads(_gh("project", "view", project, "--owner", owner, "--format", "json"))
     project_id = vista.get("id")
     if not project_id:
-        raise ErrorConfig(f"el Project {owner}/{project} no devolvió un id.")
+        raise ErrorConfig(f"the Project {owner}/{project} didn't return an id.")
+    titulo = str(vista.get("title") or "tasks")
 
     campos = json.loads(
         _gh("project", "field-list", project, "--owner", owner, "--format", "json", "--limit", "50")
     ).get("fields", [])
     for campo in campos:
         if campo.get("name", "").casefold() == campo_fecha.casefold():
-            return project_id, campo["id"]
+            return project_id, campo["id"], titulo
 
-    nombres = ", ".join(c.get("name", "?") for c in campos) or "(ninguno)"
+    nombres = ", ".join(c.get("name", "?") for c in campos) or "(none)"
     raise ErrorConfig(
-        f"el Project no tiene un campo llamado «{campo_fecha}».\nCampos disponibles: {nombres}"
+        f'the Project has no field named "{campo_fecha}".\nAvailable fields: {nombres}'
     )
 
 
@@ -124,11 +126,11 @@ def cargar(refrescar: bool = False) -> Config:
     datos = _leer_toml()
     faltan = [clave for clave in ("owner", "project") if not datos.get(clave)]
     if faltan:
-        raise ErrorConfig(f"a {ruta_config()} le faltan claves: {', '.join(faltan)}")
+        raise ErrorConfig(f"{ruta_config()} is missing keys: {', '.join(faltan)}")
 
     owner = str(datos["owner"])
     project = str(datos["project"])
-    campo_fecha = str(datos.get("campo_fecha", "Vencimiento"))
+    campo_fecha = str(datos.get("campo_fecha", "Due date"))
     clave = f"{owner}/{project}/{campo_fecha}"
 
     cache: dict = {}
@@ -142,9 +144,14 @@ def cargar(refrescar: bool = False) -> Config:
     guardado = cache.get(clave)
     if guardado:
         project_id, campo_id = guardado["project_id"], guardado["campo_fecha_id"]
+        titulo_proyecto = guardado.get("project_title", "tasks")
     else:
-        project_id, campo_id = _resolver_ids(owner, project, campo_fecha)
-        cache[clave] = {"project_id": project_id, "campo_fecha_id": campo_id}
+        project_id, campo_id, titulo_proyecto = _resolver_ids(owner, project, campo_fecha)
+        cache[clave] = {
+            "project_id": project_id,
+            "campo_fecha_id": campo_id,
+            "project_title": titulo_proyecto,
+        }
         try:
             ruta.parent.mkdir(parents=True, exist_ok=True)
             ruta.write_text(json.dumps(cache, indent=2), "utf-8")
@@ -156,7 +163,8 @@ def cargar(refrescar: bool = False) -> Config:
         project=project,
         campo_fecha=campo_fecha,
         estado_hecho=str(datos.get("estado_hecho", "Done")),
-        cuerpo_nuevo=str(datos.get("cuerpo_nuevo", "Creada desde la TUI de tareas.")),
+        cuerpo_nuevo=str(datos.get("cuerpo_nuevo", "Created from the tareas TUI.")),
         project_id=project_id,
         campo_fecha_id=campo_id,
+        project_title=titulo_proyecto,
     )

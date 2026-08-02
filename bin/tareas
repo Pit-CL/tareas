@@ -28,12 +28,12 @@ GUION=$(_resolver "$0")
 RAIZ=$(cd "$(dirname "$GUION")/.." && pwd)
 
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "tareas: necesita python3 (3.11 o superior)" >&2
+  echo "tareas: needs python3 (3.11 or higher)" >&2
   exit 2
 fi
 
 if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-  echo "tareas: necesita Python 3.11 o superior (el actual es $(python3 -V 2>&1))" >&2
+  echo "tareas: needs Python 3.11 or higher (current is $(python3 -V 2>&1))" >&2
   exit 2
 fi
 
@@ -44,14 +44,14 @@ if [ -x "$VENV/bin/python" ]; then
 fi
 
 if [ "$instalado" != "$VERSION_TEXTUAL" ]; then
-  echo "tareas: preparando el entorno en $VENV (solo esta vez)…"
+  echo "tareas: setting up the environment in $VENV (only this once)…"
   if [ ! -x "$VENV/bin/python" ] && ! python3 -m venv "$VENV"; then
-    echo "tareas: no pude crear el venv en $VENV" >&2
+    echo "tareas: couldn't create the venv in $VENV" >&2
     exit 2
   fi
   "$VENV/bin/python" -m pip install --quiet --upgrade pip
   if ! "$VENV/bin/python" -m pip install --quiet "textual==$VERSION_TEXTUAL"; then
-    echo "tareas: falló la instalación de textual==$VERSION_TEXTUAL" >&2
+    echo "tareas: failed to install textual==$VERSION_TEXTUAL" >&2
     exit 2
   fi
 fi
@@ -69,6 +69,6 @@ while true; do
     130) exit 130 ;;                     # ctrl-c
     143) exit 143 ;;                     # SIGTERM
   esac
-  echo "tareas: la app terminó con código $salida; reinicio en 2s (ctrl-c para salir)…" >&2
+  echo "tareas: the app exited with code $salida; restarting in 2s (ctrl-c to quit)…" >&2
   sleep 2
 done
