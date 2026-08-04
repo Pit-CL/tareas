@@ -470,6 +470,21 @@ async def test_ctrl_s_tambien_crea():
         assert creada.titulo == "Saved with ctrl+s"
 
 
+async def test_el_hint_de_nueva_no_promete_ctrl_enter():
+    """`ctrl+enter` no es distinguible de `enter` en la mayoría de las terminales
+    (sin el protocolo de teclado de Kitty de punta a punta llegan como el mismo
+    byte `\\r`), así que el hint no debe prometerlo: `ctrl+s` es el atajo que de
+    verdad dispara `crear` en cualquier terminal."""
+    app = TareasApp(BackendDemo(repo_actual="vela/landing"))
+    async with app.run_test() as pilot:
+        await _listo(pilot)
+        await pilot.press("n")
+        await pilot.pause()
+        texto = str(pilot.app.screen.query_one("#nueva-hint").content)
+        assert "^s create" in texto
+        assert "^enter" not in texto
+
+
 async def test_ctrl_enter_crea_desde_cualquier_campo():
     app = TareasApp(BackendDemo(repo_actual="vela/landing"))
     async with app.run_test() as pilot:
