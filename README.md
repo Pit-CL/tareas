@@ -242,6 +242,28 @@ Two limitations worth knowing:
   change it; to alter the recurrence of an existing task, edit the
   `<!-- tareas:repeat=… -->` comment in the issue body.
 
+### Linked pull requests
+
+When a pull request says `Closes #N` for a task's issue, the list shows a small chip
+at the right edge of the title, and **only then** — a task nobody has started stays
+clean, and the title keeps the whole column:
+
+| Chip | What it means |
+|---|---|
+| `#45✓` | Checks passed (or the PR is already merged) |
+| `#45✗` | Checks failed, or the PR was closed without merging |
+| `#45·` | Checks running, no checks at all, or the PR is still a draft |
+
+One glyph can't tell *merged* from *green* — the detail spells it out, because there
+it fits: `PR #45 · open · CI passing · ready to merge`, `PR #45 · draft · CI running`,
+`PR #45 · closed unmerged`. *Ready to merge* only shows up when GitHub agrees on all
+three counts: open, not a draft, no failing checks and no conflicts. The same line
+counts the issue's comments (`3 comments`) when there are any — the conversation the
+TUI doesn't show but you want to know about.
+
+All of it travels in the very same query that lists the Project, so the chip costs no
+extra round trip: refreshing takes as long as it always did.
+
 ### Setting a due date without typing
 
 The due date dialog has clickable shortcuts — *today*, *tomorrow*, *+3 days*,

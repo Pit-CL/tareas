@@ -491,3 +491,134 @@ async def test_el_alta_devuelve_la_tarea_con_su_node_id(monkeypatch):
     creada = await Backend(CONFIG).crear("pit/web", "Something", None)
 
     assert creada.issue_id == "I_42"
+
+
+# ------------------------------------------------------------------ PR vinculado
+def _con_pr(*prs: dict, comentarios: int = 0) -> GhFalso:
+    """`gh` de mentira cuyo Project devuelve una tarea con esos PRs vinculados."""
+    return GhFalso(
+        {
+            "ItemsDelProject": gh_falso.pagina(
+                [gh_falso.item(1, prs=list(prs), comentarios=comentarios)]
+            )
+        }
+    )
+
+
+async def _una(monkeypatch, falso: GhFalso):
+    monkeypatch.setattr(datos, "gh", falso)
+    return (await Backend(CONFIG).listar())[0]
+
+
+async def test_el_pr_vinculado_llega_en_la_misma_lectura_de_la_lista(monkeypatch):
+    """La regla dura de este chip: cero llamadas extra en el camino de listar.
+
+    Si algún día el PR se resolviera con una segunda consulta, el refresco pasaría de
+    una ida y vuelta a una por tarea y este test lo cazaría antes que el usuario.
+    """
+    falso = _con_pr(gh_falso.pr(45), comentarios=3)
+    tarea = await _una(monkeypatch, falso)
+
+    assert tarea.pr is not None and tarea.pr.numero == 45
+    assert tarea.comentarios == 3
+    assert falso.veces("ItemsDelProject") == 1
+    assert len(falso.usados) == 1, f"llamadas de más: {falso.usados}"
+
+
+async def test_la_consulta_pide_los_prs_que_cerrarian_el_issue():
+    """Los defaults del campo importan: sin `includeClosedPrs` un PR rechazado deja la
+    fila sin chip, y con `userLinkedOnly` no aparece ninguno vinculado por `Closes #N`
+    (verificado contra la API real el 2026-08-04)."""
+    consulta = datos._Q_ITEMS
+
+    assert "closedByPullRequestsReferences" in consulta
+    assert "includeClosedPrs: true" in consulta
+    assert "userLinkedOnly" not in consulta
+    assert "comments { totalCount }" in consulta
+
+
+async def test_un_pr_abierto_con_ci_verde_queda_listo_para_mergear(monkeypatch):
+    tarea = await _una(monkeypatch, _con_pr(gh_falso.pr(45, ci="SUCCESS")))
+
+    assert (tarea.pr.estado, tarea.pr.ci, tarea.pr.listo) == ("open", "success", True)
+
+
+@pytest.mark.parametrize("rollup", ["FAILURE", "ERROR"])
+async def test_la_ci_roja_no_esta_lista_para_mergear(monkeypatch, rollup):
+    """GitHub distingue FAILURE de ERROR; para el usuario las dos son «está roja»."""
+    tarea = await _una(monkeypatch, _con_pr(gh_falso.pr(45, ci=rollup)))
+
+    assert (tarea.pr.ci, tarea.pr.listo) == ("failure", False)
+
+
+async def test_un_draft_no_esta_listo_aunque_la_ci_este_verde(monkeypatch):
+    tarea = await _una(monkeypatch, _con_pr(gh_falso.pr(45, draft=True, ci="SUCCESS")))
+
+    assert (tarea.pr.estado, tarea.pr.listo) == ("draft", False)
+
+
+async def test_la_ci_corriendo_no_esta_lista_pero_un_pr_sin_checks_si(monkeypatch):
+    """Un rollup en PENDING es trabajo en curso; uno AUSENTE es un repo sin CI, y ahí
+    hacer esperar el «ready to merge» sería esperar para siempre."""
+    corriendo = await _una(monkeypatch, _con_pr(gh_falso.pr(45, ci="PENDING")))
+    sin_checks = await _una(monkeypatch, _con_pr(gh_falso.pr(45, ci=None)))
+
+    assert (corriendo.pr.ci, corriendo.pr.listo) == ("pending", False)
+    assert (sin_checks.pr.ci, sin_checks.pr.listo) == ("none", True)
+
+
+async def test_un_pr_con_conflictos_no_se_anuncia_como_listo(monkeypatch):
+    tarea = await _una(monkeypatch, _con_pr(gh_falso.pr(45, mergeable="CONFLICTING")))
+
+    assert tarea.pr.listo is False
+
+
+async def test_mergeable_desconocido_tampoco_afirma_que_esta_listo(monkeypatch):
+    """GitHub responde UNKNOWN mientras lo calcula: eso no es un permiso."""
+    tarea = await _una(monkeypatch, _con_pr(gh_falso.pr(45, mergeable="UNKNOWN")))
+
+    assert tarea.pr.listo is False
+
+
+async def test_un_pr_mergeado_se_reconoce_como_tal(monkeypatch):
+    tarea = await _una(monkeypatch, _con_pr(gh_falso.pr(45, estado="MERGED")))
+
+    assert (tarea.pr.estado, tarea.pr.listo) == ("merged", False)
+
+
+async def test_una_tarea_sin_pr_no_inventa_ninguno(monkeypatch):
+    tarea = await _una(monkeypatch, _con_pr())
+
+    assert tarea.pr is None
+    assert tarea.comentarios == 0
+
+
+async def test_entre_varios_pr_gana_el_vivo_y_no_el_intento_muerto(monkeypatch):
+    """`closedByPullRequestsReferences` no promete orden, y con los cerrados incluidos
+    un intento abandonado puede venir primero: el chip tiene que hablar del PR que el
+    usuario está esperando."""
+    tarea = await _una(
+        monkeypatch,
+        _con_pr(
+            gh_falso.pr(40, estado="CLOSED"),
+            gh_falso.pr(41, estado="MERGED"),
+            gh_falso.pr(42, draft=True),
+            gh_falso.pr(43),
+        ),
+    )
+
+    assert tarea.pr.numero == 43
+
+
+async def test_a_igual_estado_gana_el_pr_mas_nuevo(monkeypatch):
+    tarea = await _una(monkeypatch, _con_pr(gh_falso.pr(40), gh_falso.pr(52)))
+
+    assert tarea.pr.numero == 52
+
+
+async def test_un_pr_ilegible_no_se_lleva_puesto_al_bueno(monkeypatch):
+    """Misma regla que el resto de la capa de datos: lo que no se entiende se descarta,
+    nunca tumba la lectura entera."""
+    tarea = await _una(monkeypatch, _con_pr({"state": "OPEN"}, gh_falso.pr(45)))
+
+    assert tarea.pr.numero == 45
