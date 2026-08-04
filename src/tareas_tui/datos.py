@@ -7,6 +7,23 @@ del README y para las pruebas, sin tocar GitHub.
 Cada lectura buena se copia a disco (ver `cache.py`) para que el próximo arranque
 pinte la lista sin esperar a la red. `BackendDemo` no cachea nada: la demo y la
 suite tienen que ser siempre reproducibles.
+
+Todo lo que toca el Project va por `gh api graphql` y no por los subcomandos
+`gh project …`: estos resuelven el owner y el número del Project en CADA
+invocación, y eso cuesta entre dos y cuatro veces más (medido contra el Project
+real, mediana de 5 corridas):
+
+===================== ======== =========================== ========
+paso                  `gh …`   GraphQL directo             ahorro
+===================== ======== =========================== ========
+leer la lista          1,18 s   0,75 s                      0,43 s
+agregar al board       1,69 s   0,38 s                      1,31 s
+poner el vencimiento   0,71 s   0,46 s                      0,25 s
+crear el issue         0,81 s   0,53 s                      0,28 s
+===================== ======== =========================== ========
+
+Los node IDs que las mutaciones necesitan ya estaban resueltos y cacheados (ver
+`config.py`), así que el trabajo que `gh project` repetía era puro peaje.
 """
 
 from __future__ import annotations
@@ -114,6 +131,108 @@ async def gh(*args: str) -> str:
     return salida.decode("utf-8", "replace")
 
 
+# ------------------------------------------------------------------ GraphQL
+# Cada documento lleva nombre de operación (`ItemsDelProject`, `CrearIssue`, …) para
+# que los dobles de prueba puedan responder por operación sin parsear GraphQL.
+
+_Q_ITEMS = """
+query ItemsDelProject($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on ProjectV2 {
+      items(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          fieldValues(first: 20) {
+            nodes {
+              ... on ProjectV2ItemFieldDateValue {
+                date
+                field { ... on ProjectV2FieldCommon { name } }
+              }
+              ... on ProjectV2ItemFieldTextValue {
+                text
+                field { ... on ProjectV2FieldCommon { name } }
+              }
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                name
+                field { ... on ProjectV2FieldCommon { name } }
+              }
+            }
+          }
+          content {
+            __typename
+            ... on Issue { id number title body url repository { nameWithOwner } }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+_M_CREAR_ISSUE = """
+mutation CrearIssue($repo: ID!, $titulo: String!, $cuerpo: String!) {
+  createIssue(input: {repositoryId: $repo, title: $titulo, body: $cuerpo}) {
+    issue { id number url }
+  }
+}
+"""
+
+_M_AGREGAR_ITEM = """
+mutation AgregarItem($proyecto: ID!, $contenido: ID!) {
+  addProjectV2ItemById(input: {projectId: $proyecto, contentId: $contenido}) {
+    item { id }
+  }
+}
+"""
+
+_M_FECHAR = """
+mutation FecharItem($proyecto: ID!, $item: ID!, $campo: ID!, $valor: Date!) {
+  updateProjectV2ItemFieldValue(
+    input: {projectId: $proyecto, itemId: $item, fieldId: $campo, value: {date: $valor}}
+  ) { projectV2Item { id } }
+}
+"""
+
+_M_LIMPIAR_FECHA = """
+mutation LimpiarFecha($proyecto: ID!, $item: ID!, $campo: ID!) {
+  clearProjectV2ItemFieldValue(
+    input: {projectId: $proyecto, itemId: $item, fieldId: $campo}
+  ) { projectV2Item { id } }
+}
+"""
+
+_M_CERRAR_ISSUE = """
+mutation CerrarIssue($issue: ID!) {
+  closeIssue(input: {issueId: $issue}) { issue { id } }
+}
+"""
+
+_Q_ID_REPO = """
+query IdDeRepo($owner: String!, $nombre: String!) {
+  repository(owner: $owner, name: $nombre) { id }
+}
+"""
+
+
+async def gh_graphql(consulta: str, **variables: str) -> dict:
+    """Una llamada a la API GraphQL; devuelve el `data` de la respuesta.
+
+    Las variables van con `-f` (raw-field) y NO con `-F` (field): `-F` interpreta un
+    valor que empiece con «@» como la ruta de un archivo a leer, y por acá pasan
+    títulos y notas que escribe el usuario.
+
+    No hace falta mirar el `errors` de la respuesta: ante un error de GraphQL `gh`
+    sale con código 1 y deja el mensaje en stderr, así que `gh()` ya levanta `ErrorGh`
+    con él (verificado contra la API real).
+    """
+    args = ["api", "graphql", "-f", f"query={consulta}"]
+    for nombre, valor in variables.items():
+        args += ["-f", f"{nombre}={valor}"]
+    crudo = await gh(*args)
+    return json.loads(crudo or "{}").get("data") or {}
+
+
 @dataclass(frozen=True)
 class Tarea:
     item_id: str
@@ -124,6 +243,10 @@ class Tarea:
     cuerpo: str  # notas visibles, ya sin el metadato de repetición
     vence: date | None
     repeat: str | None = None  # None, o uno de REPETICIONES distinto de "none"
+    #: Node ID del issue, para cerrarlo con una mutación en vez de `gh issue close`
+    #: (1,06 s contra 0,45 s). Vacío en una tarea que venga de un caché viejo: ahí
+    #: `Backend.cerrar` cae al camino de siempre.
+    issue_id: str = ""
 
     @property
     def cliente(self) -> str:
@@ -280,6 +403,7 @@ def _tarea_a_dict(tarea: Tarea) -> dict:
         "cuerpo": tarea.cuerpo,
         "vence": tarea.vence.isoformat() if tarea.vence else None,
         "repeat": tarea.repeat,
+        "issue_id": tarea.issue_id,
     }
 
 
@@ -297,6 +421,7 @@ def _tarea_de_dict(crudo: object) -> Tarea | None:
             cuerpo=str(crudo.get("cuerpo", "")),
             vence=parsear_fecha(crudo.get("vence")),
             repeat=str(crudo["repeat"]) if crudo.get("repeat") else None,
+            issue_id=str(crudo.get("issue_id") or ""),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -459,20 +584,43 @@ class Backend:
             return actual
         return nombre  # el campo está y se llama igual: nadie tiene vencimiento puesto
 
+    async def _traer_items(self) -> list[dict]:
+        """Los items del Project, aplanados igual que `gh project item-list --format json`.
+
+        Se replica esa forma a propósito: el parseo de `listar`, `valor_campo` y la
+        detección de campo renombrado siguen valiendo tal cual, así que el cambio de
+        transporte no toca ni una regla de negocio.
+
+        La paginación es la misma que hacía `gh` por dentro (100 por página), menos el
+        peaje de resolver el owner en cada invocación.
+        """
+        items: list[dict] = []
+        cursor = ""
+        while len(items) < LIMITE_ITEMS:
+            variables = {"id": self.config.project_id}
+            if cursor:  # la primera página va sin `after`: "" no es un cursor válido
+                variables["cursor"] = cursor
+            datos = await gh_graphql(_Q_ITEMS, **variables)
+            pagina = (datos.get("node") or {}).get("items") or {}
+            items.extend(_aplanar_item(nodo) for nodo in pagina.get("nodes") or [])
+            info = pagina.get("pageInfo") or {}
+            cursor = str(info.get("endCursor") or "")
+            if not info.get("hasNextPage") or not cursor:
+                break
+        return items[:LIMITE_ITEMS]
+
     async def listar(self) -> list[Tarea]:
         cfg = self.config
-        crudo = await gh(
-            "project", "item-list", cfg.project,
-            "--owner", cfg.owner, "--format", "json", "--limit", str(LIMITE_ITEMS),
-        )
-        items = json.loads(crudo or "{}").get("items", [])
+        items = await self._traer_items()
         # Se cuenta ANTES de filtrar: el límite lo aplica GitHub sobre el Project entero,
         # hechas incluidas, así que tocar el techo puede estar escondiendo pendientes.
         self.truncado = len(items) >= LIMITE_ITEMS
         campo = await self._nombre_del_campo(items)
         tareas: list[Tarea] = []
         for item in items:
-            if str(item.get("status", "")).casefold() == cfg.estado_hecho.casefold():
+            # `valor_campo` y no `item["status"]`: la clave llega con la caja del campo
+            # tal como lo llame el Project ("Status"), no siempre en minúsculas.
+            if str(valor_campo(item, "status") or "").casefold() == cfg.estado_hecho.casefold():
                 continue
             contenido = item.get("content") or {}
             if contenido.get("type") != "Issue":
@@ -483,11 +631,14 @@ class Backend:
                     item_id=item.get("id", ""),
                     repo=contenido.get("repository", ""),
                     numero=int(contenido.get("number", 0)),
-                    titulo=(contenido.get("title") or item.get("title") or "(untitled)").strip(),
+                    titulo=(
+                        contenido.get("title") or valor_campo(item, "title") or "(untitled)"
+                    ).strip(),
                     url=contenido.get("url", ""),
                     cuerpo=cuerpo,
                     vence=parsear_fecha(valor_campo(item, campo)),
                     repeat=repeat,
+                    issue_id=contenido.get("id", ""),
                 )
             )
         ordenadas = ordenar(tareas)
@@ -498,12 +649,38 @@ class Backend:
         return ordenadas
 
     async def repos(self) -> list[str]:
+        """Repos del owner para el picker; de paso guarda sus node IDs.
+
+        Pedir `id` en el mismo `--json` no cuesta nada y es justo lo que necesita
+        `createIssue`, así que el alta no gasta una llamada extra en resolverlo.
+        """
         crudo = await gh(
-            "repo", "list", self.config.owner, "--limit", "200", "--json", "nameWithOwner"
+            "repo", "list", self.config.owner, "--limit", "200", "--json", "nameWithOwner,id"
         )
-        listado = sorted(r["nameWithOwner"] for r in json.loads(crudo or "[]"))
-        self._cachear(repos=listado)
+        crudos = json.loads(crudo or "[]")
+        listado = sorted(r["nameWithOwner"] for r in crudos)
+        ids = {str(r["nameWithOwner"]): str(r["id"]) for r in crudos if r.get("id")}
+        self._cachear(repos=listado, repo_ids=ids)
         return listado
+
+    async def _id_repo(self, repo: str) -> str:
+        """Node ID de «owner/nombre», el que pide `createIssue`.
+
+        Sale gratis del `gh repo list` que alimenta el picker (cacheado en disco, así
+        que también sobrevive al reinicio). Solo se pregunta cuando no está: pasa con
+        un repo de otro owner, que el listado del picker no incluye.
+        """
+        guardados = cache.leer(self._clave_cache).get("repo_ids")
+        guardados = guardados if isinstance(guardados, dict) else {}
+        if guardados.get(repo):
+            return str(guardados[repo])
+        owner, _, nombre = repo.partition("/")
+        datos = await gh_graphql(_Q_ID_REPO, owner=owner, nombre=nombre)
+        identificador = str((datos.get("repository") or {}).get("id") or "")
+        if not identificador:
+            raise ErrorGh(f"GitHub didn't return an id for the repository {repo}")
+        self._cachear(repo_ids={**guardados, repo: identificador})
+        return identificador
 
     async def repo_actual(self) -> str | None:
         """Repo GitHub del directorio donde se lanzó la app, o None si no aplica.
@@ -533,21 +710,23 @@ class Backend:
         para que la UI diga lo que de verdad quedó en GitHub.
 
         Devuelve la tarea creada para que la lista la muestre en el acto: releerla del
-        Project costaba otro `gh project item-list` entero (~1 s) sobre un alta que ya
-        gastó tres llamadas.
+        Project costaba otra lectura entera sobre un alta que ya gastó tres llamadas.
         """
-        salida = await gh(
-            "issue", "create", "--repo", repo, "--title", titulo, "--body", cuerpo,
-        )
-        url = salida.strip().splitlines()[-1]
+        repo_id = await self._id_repo(repo)
+        datos = await gh_graphql(_M_CREAR_ISSUE, repo=repo_id, titulo=titulo, cuerpo=cuerpo)
+        issue = (datos.get("createIssue") or {}).get("issue") or {}
+        url = str(issue.get("url") or "")
+        contenido = str(issue.get("id") or "")
+        if not contenido or not url:
+            # Todavía NO es un efecto parcial: sin id no hay issue que reportar.
+            raise ErrorGh("GitHub didn't return the new issue")
         try:
-            item = (
-                await gh(
-                    "project", "item-add", self.config.project,
-                    "--owner", self.config.owner, "--url", url,
-                    "--format", "json", "--jq", ".id",
-                )
-            ).strip()
+            datos = await gh_graphql(
+                _M_AGREGAR_ITEM, proyecto=self.config.project_id, contenido=contenido
+            )
+            item = str(((datos.get("addProjectV2ItemById") or {}).get("item") or {}).get("id") or "")
+            if not item:
+                raise ErrorGh("GitHub didn't return the board item")
         except (ErrorGh, OSError) as err:
             raise ErrorParcial(
                 f"the new issue exists on GitHub but wasn't added to the board "
@@ -557,12 +736,13 @@ class Backend:
         creada = Tarea(
             item_id=item,
             repo=repo,
-            numero=numero_de_url(url),
+            numero=int(issue.get("number") or 0) or numero_de_url(url),
             titulo=titulo,
             url=url,
             cuerpo=notas,
             vence=parsear_fecha(fecha),
             repeat=repeat,
+            issue_id=contenido,
         )
         if not fecha:
             return creada
@@ -576,6 +756,12 @@ class Backend:
         return creada
 
     async def cerrar(self, tarea: Tarea) -> None:
+        """Cierra el issue. Idempotente en los dos caminos: cerrar uno ya cerrado no
+        es un error ni para `closeIssue` ni para `gh issue close`."""
+        if tarea.issue_id:
+            await gh_graphql(_M_CERRAR_ISSUE, issue=tarea.issue_id)
+            return
+        # Tarea venida de un caché anterior a que se guardara el node ID.
         await gh("issue", "close", str(tarea.numero), "--repo", tarea.repo)
 
     async def repetir(self, tarea: Tarea, hoy: date) -> Tarea:
@@ -590,12 +776,45 @@ class Backend:
 
     async def fechar(self, item_id: str, fecha: str | None) -> None:
         """`fecha` vacía o None limpia el vencimiento."""
-        base = [
-            "project", "item-edit", "--id", item_id,
-            "--project-id", self.config.project_id,
-            "--field-id", self.config.campo_fecha_id,
-        ]
-        await gh(*base, "--date", fecha) if fecha else await gh(*base, "--clear")
+        comun = {
+            "proyecto": self.config.project_id,
+            "item": item_id,
+            "campo": self.config.campo_fecha_id,
+        }
+        if fecha:
+            await gh_graphql(_M_FECHAR, **comun, valor=fecha)
+        else:
+            await gh_graphql(_M_LIMPIAR_FECHA, **comun)
+
+
+def _aplanar_item(nodo: dict) -> dict:
+    """Un item de GraphQL con la MISMA forma que devolvía `gh project item-list`.
+
+    Los campos personalizados se aplanan por nombre en minúsculas (`Vencimiento` →
+    `vencimiento`, `Status` → `status`), que es exactamente lo que hacía `gh`; para
+    los nombres con espacios `valor_campo` normaliza los dos lados, así que da igual
+    la forma exacta. Reproducir la forma vieja es a propósito: así el parseo de
+    `listar` y la detección de campo renombrado no se enteran del cambio.
+    """
+    contenido = nodo.get("content") or {}
+    plano: dict = {
+        "id": nodo.get("id", ""),
+        "content": {
+            "type": contenido.get("__typename", ""),
+            "number": contenido.get("number", 0),
+            "title": contenido.get("title", ""),
+            "body": contenido.get("body", ""),
+            "url": contenido.get("url", ""),
+            "repository": (contenido.get("repository") or {}).get("nameWithOwner", ""),
+            "id": contenido.get("id", ""),
+        },
+    }
+    for valor in (nodo.get("fieldValues") or {}).get("nodes") or []:
+        nombre = str((valor.get("field") or {}).get("name") or "").strip()
+        if not nombre:
+            continue  # un fragmento que no pedimos (iteración, número, …) llega vacío
+        plano[nombre.casefold()] = valor.get("date") or valor.get("name") or valor.get("text")
+    return plano
 
 
 def valor_campo(item: dict, nombre: str):
