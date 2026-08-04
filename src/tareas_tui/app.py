@@ -485,7 +485,15 @@ class NuevaScreen(DialogoModal):
                 yield Button("\\[cancel]", id="nueva-cancelar", classes="chip secundario")
             yield Static("", id="nueva-error", classes="error-linea")
             yield Static(
-                "1-5 date · ^r repeat · ^enter create · esc cancel",
+                # `^enter` (Ctrl+Enter) no es un atajo confiable: la mayoría de las
+                # terminales (sin el protocolo de teclado de Kitty de punta a punta,
+                # p. ej. cualquier sesión con tmux/SSH de por medio) mandan el MISMO
+                # byte que Enter (\r) para ambos, así que Textual nunca ve "ctrl+enter"
+                # y el binding no dispara — verificado con XTermParser().feed("\r").
+                # `ctrl+s` sí llega distinguible (Textual desactiva IXON/IXOFF, así
+                # que ni el flow control de la tty se lo come) y sigue bindeado en
+                # BINDINGS más abajo: acá solo se corrige lo que el hint promete.
+                "1-5 date · ^r repeat · ^s create · esc cancel",
                 id="nueva-hint",
                 classes="hint",
             )
