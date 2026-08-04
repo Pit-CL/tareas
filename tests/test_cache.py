@@ -275,3 +275,65 @@ async def test_un_cache_sin_node_id_se_lee_igual():
 
     tareas = Backend(CONFIG).instantanea().tareas
     assert [t.issue_id for t in tareas] == [""]
+
+
+# ------------------------------------------------------------------ PR vinculado
+async def test_el_pr_y_los_comentarios_sobreviven_al_cache(monkeypatch):
+    """Sin esto la primera pantalla tras reiniciar salía sin chips y estos aparecían
+    solos un segundo después, que es justo el parpadeo que el caché viene a evitar."""
+    monkeypatch.setattr(
+        datos,
+        "gh",
+        GhFalso(
+            {
+                "ItemsDelProject": gh_falso.pagina(
+                    [gh_falso.item(1, prs=[gh_falso.pr(45, ci="FAILURE")], comentarios=2)]
+                )
+            }
+        ),
+    )
+    tareas = await Backend(CONFIG).listar()
+    guardada = Backend(CONFIG).instantanea().tareas[0]  # otro proceso, mismo Project
+
+    assert guardada == tareas[0]
+    assert guardada.pr == datos.PrVinculado(numero=45, estado="open", ci="failure", mergeable=True)
+    assert guardada.comentarios == 2
+
+
+async def test_un_cache_sin_pr_se_lee_igual():
+    """El de una versión anterior no trae la clave: la tarea se lee sin chip y el primer
+    refresco lo pone, como con cualquier dato nuevo."""
+    viejo = {
+        "item_id": "PVTI_1",
+        "repo": "pit/web",
+        "numero": 1,
+        "titulo": "Task 1",
+        "vence": "2026-09-01",
+    }
+    cache.escribir("pit/1", {"tareas": [viejo]})
+    guardada = Backend(CONFIG).instantanea().tareas[0]
+
+    assert guardada.pr is None
+    assert guardada.comentarios == 0
+
+
+async def test_un_pr_corrupto_en_el_cache_no_tumba_la_tarea():
+    cache.escribir(
+        "pit/1",
+        {
+            "tareas": [
+                {
+                    "item_id": "PVTI_1",
+                    "repo": "pit/web",
+                    "numero": 1,
+                    "titulo": "Task 1",
+                    "vence": None,
+                    "pr": {"numero": "no soy un número"},
+                }
+            ]
+        },
+    )
+    guardada = Backend(CONFIG).instantanea().tareas[0]
+
+    assert guardada.titulo == "Task 1"
+    assert guardada.pr is None

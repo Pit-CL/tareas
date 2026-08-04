@@ -44,6 +44,31 @@ def variables(args: tuple[str, ...]) -> dict[str, str]:
 
 
 # ------------------------------------------------------------------ respuestas
+def pr(
+    numero: int = 45,
+    *,
+    estado: str = "OPEN",
+    draft: bool = False,
+    ci: str | None = "SUCCESS",
+    mergeable: str = "MERGEABLE",
+) -> dict:
+    """Un nodo de `closedByPullRequestsReferences`, con la forma de la API real.
+
+    `ci` es el `statusCheckRollup.state` (SUCCESS, FAILURE, ERROR, PENDING…) y `None`
+    significa un PR SIN un solo check: ahí GitHub manda el rollup entero en null, que
+    no es lo mismo que uno corriendo (verificado contra la API el 2026-08-04).
+    """
+    return {
+        "number": numero,
+        "state": estado,
+        "isDraft": draft,
+        "mergeable": mergeable,
+        "commits": {
+            "nodes": [{"commit": {"statusCheckRollup": None if ci is None else {"state": ci}}}]
+        },
+    }
+
+
 def item(
     indice: int = 0,
     *,
@@ -54,6 +79,8 @@ def item(
     titulo: str | None = None,
     cuerpo: str = "",
     tipo: str = "Issue",
+    prs: list[dict] | None = None,
+    comentarios: int = 0,
 ) -> dict:
     """Un nodo de item tal cual lo devuelve la API GraphQL."""
     valores: list[dict] = [{"name": estado, "field": {"name": "Status"}}]
@@ -70,6 +97,8 @@ def item(
             "body": cuerpo,
             "url": f"https://github.com/{repo}/issues/{indice}",
             "repository": {"nameWithOwner": repo},
+            "comments": {"totalCount": comentarios},
+            "closedByPullRequestsReferences": {"nodes": list(prs or [])},
         },
     }
 

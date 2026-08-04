@@ -44,6 +44,7 @@ from .datos import (
     ErrorParcial,
     Tarea,
     acortar,
+    chip_pr,
     componer_cuerpo,
     etiqueta_vencimiento,
     fecha_larga,
@@ -51,6 +52,7 @@ from .datos import (
     ordenar,
     parsear_fecha,
     proxima_fecha,
+    resumen_pr,
 )
 
 REFRESCO_SEGUNDOS = 300.0
@@ -329,6 +331,11 @@ class DetalleScreen(DialogoModal):
         with Vertical(id="dlg-detalle", classes="dlg"):
             yield Static(self.tarea.titulo, id="det-titulo")
             yield Static(self._meta(), id="det-meta")
+            # La fila solo existe si hay algo que decir: en un pane de 15 filas, una
+            # línea en blanco es una línea menos de descripción.
+            actividad = self._actividad()
+            if actividad is not None:
+                yield Static(actividad, id="det-actividad")
             with VerticalScroll(id="det-cuerpo"):
                 yield Markdown(self.tarea.cuerpo or "_(no description)_")
             yield Static("", classes="respiro")
@@ -354,6 +361,23 @@ class DetalleScreen(DialogoModal):
             partes.append(Text(f"↻ repeats {self.tarea.repeat}"))
         return Text(" · ").join(partes)
 
+    def _actividad(self) -> Text | None:
+        """PR vinculado y comentarios; None si la tarea no tiene ni lo uno ni lo otro.
+
+        Es la versión en palabras del chip de la lista: acá sí hay lugar para separar
+        «merged» de «CI verde» y «closed» de «CI roja», que en un glifo se confundirían.
+        El PR se lleva el color del chip -verde, rojo o color 7- para que una CI rota se
+        vea al abrir el detalle sin tener que leer la frase.
+        """
+        partes: list[Text] = []
+        if self.tarea.pr is not None:
+            _, estilo = chip_pr(self.tarea.pr)
+            partes.append(Text(resumen_pr(self.tarea.pr), estilo))
+        if self.tarea.comentarios:
+            plural = "" if self.tarea.comentarios == 1 else "s"
+            partes.append(Text(f"{self.tarea.comentarios} comment{plural}", SECUNDARIO))
+        return Text(" · ").join(partes) if partes else None
+
     def al_montar(self) -> None:
         self.query_one("#det-cuerpo").focus()
 
@@ -363,8 +387,13 @@ class DetalleScreen(DialogoModal):
         # modal gigante. El techo lo pone la pantalla menos el resto del diálogo
         # (bordes, título, meta, separador, botones, hint y, si respira, su padding).
         alto = self.app.size.height
+        # La línea de actividad, cuando está, es una fila más de diálogo que el cuerpo
+        # tiene que devolver: sin descontarla el modal crecía hasta pasarse del borde.
+        extra = 1 if self.query("#det-actividad") else 0
         for cuerpo in self.query("#det-cuerpo"):
-            cuerpo.styles.max_height = max(3, alto - (11 if alto >= UMBRAL_HOLGADO else 8))
+            cuerpo.styles.max_height = max(
+                3, alto - extra - (11 if alto >= UMBRAL_HOLGADO else 8)
+            )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
@@ -1056,10 +1085,29 @@ class ListaScreen(Screen):
                 Text("↻" if tarea.repeat else "", style="yellow"),
                 # Color 7 y no dim: el repo se LEE (ver SECUNDARIO).
                 Text(acortar(tarea.cliente, ancho_cliente), style=SECUNDARIO),
-                Text(acortar(tarea.titulo, ancho_titulo)),
+                self._celda_titulo(tarea, ancho_titulo),
                 key=tarea.item_id,
             )
         self._reubicar_cursor(tabla, recordado, fila_recordada, visibles)
+
+    @staticmethod
+    def _celda_titulo(tarea: Tarea, ancho: int) -> Text:
+        """Título, con el chip del PR pegado al borde derecho de la columna.
+
+        El chip NO tiene columna propia a propósito. Una columna de DataTable ocupa su
+        ancho siempre, y la mayoría de las tareas no tiene PR: a 80 columnas serían 7 de
+        las ~62 útiles regaladas para dejar casi todas las filas en blanco. Yendo dentro
+        de la columna elástica, la tarea sin PR no paga nada, y la que sí lo tiene igual
+        queda alineada con las demás, porque la columna mide lo mismo en todas las filas.
+        """
+        texto, estilo = chip_pr(tarea.pr)
+        hueco = ancho - len(texto) - 1
+        # Con el pane tan angosto que no quedan ni tres letras de título, el chip sobra:
+        # una fila que solo dice "#45✓" no comunica de qué tarea habla.
+        if not texto or hueco < 3:
+            return Text(acortar(tarea.titulo, ancho))
+        titulo = acortar(tarea.titulo, hueco)
+        return Text.assemble(titulo, " " * (ancho - len(titulo) - len(texto)), (texto, estilo))
 
     @staticmethod
     def _item_bajo_cursor(tabla: TablaTareas) -> str | None:
@@ -1509,6 +1557,9 @@ class TareasApp(App):
 
     #det-titulo { height: auto; max-height: 2; text-style: bold; }
     #det-meta { height: 1; color: $accent; }
+    /* El color lo pone cada segmento del Text (verde/rojo/color 7 según el PR), así
+       que acá no se fija ninguno: heredar el del terminal sería pisarlos. */
+    #det-actividad { height: 1; }
     /* auto + max-height (que fija el modal según la pantalla) para que el cuerpo
        abrace su contenido en vez de estirar el diálogo hasta el borde.
        La regla que separa la meta del cuerpo va en ansi_white y no en $panel: $panel

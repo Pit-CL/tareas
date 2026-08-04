@@ -135,6 +135,47 @@ async def gh(*args: str) -> str:
 # Cada documento lleva nombre de operación (`ItemsDelProject`, `CrearIssue`, …) para
 # que los dobles de prueba puedan responder por operación sin parsear GraphQL.
 
+# El PR vinculado y los comentarios viajan DENTRO de esta consulta, en el mismo
+# fragmento del Issue que ya se pedía: listar el Project sigue costando una sola ida y
+# vuelta por página, que es lo que hace que el refresco no se note.
+#
+# El campo es `closedByPullRequestsReferences` y sus defaults importan (verificados
+# contra la API real el 2026-08-04 con un PR abierto que declaraba `Closes #34`):
+#
+# * devuelve el PR ABIERTO que cierra el issue -es literalmente su descripción, «list
+#   of open pull requests referenced from this issue»-, así que cubre el caso normal
+#   de este flujo: la tarea sigue pendiente y el PR todavía no se mergeó;
+# * `includeClosedPrs: true` suma los ya mergeados y los cerrados sin mergear. Va
+#   puesto porque sin él un PR rechazado deja la fila SIN chip, indistinguible de una
+#   tarea que nadie empezó — que es justo lo contrario de lo que pasó;
+# * `userLinkedOnly` se queda en false a propósito: con true la misma consulta devolvió
+#   `totalCount: 0` para ese PR, porque el vínculo lo hizo la palabra clave `Closes` y
+#   no una acción manual en la UI de GitHub.
+#
+# Se piden 3 PRs y no 1 porque el orden no está prometido: con los cerrados incluidos,
+# un intento muerto puede venir primero y el chip hablaría del PR equivocado (elige
+# `_pr_principal`). El costo en nodos es despreciable: 100 items × (3 PRs + 1 commit
+# cada uno) queda tres órdenes de magnitud bajo el techo de GitHub.
+#
+# Lo que sí cuesta es el tiempo de GitHub. Medido contra el Project real, A/B con las
+# dos consultas alternadas en orden sorteado (25 vueltas, mediana):
+#
+#     ===================================== ======== =========
+#     consulta                               mediana   delta
+#     ===================================== ======== =========
+#     sin PR ni comentarios (la de antes)     0,77 s        —
+#     + comments                              0,84 s   +0,06 s
+#     + el PR (número, estado, draft)         0,82 s   +0,04 s
+#     + statusCheckRollup                     0,88 s   +0,10 s
+#     + mergeable                             0,89 s   +0,11 s
+#     todo junto (esta)                       0,98 s   +0,21 s
+#     ===================================== ======== =========
+#
+# Sigue siendo UNA ida y vuelta por página -que es lo que importa: nunca una consulta
+# por tarea-, y las dos mitades caras son justo las que dan el chip (`statusCheckRollup`)
+# y el «ready to merge» honesto (`mergeable`, que es lo único que sabe de conflictos).
+# Además pasa entera dentro del worker de fondo: la lista se pinta de memoria antes y
+# durante el refresco, así que estos 0,2 s no bloquean la pantalla en ningún momento.
 _Q_ITEMS = """
 query ItemsDelProject($id: ID!, $cursor: String) {
   node(id: $id) {
@@ -161,7 +202,20 @@ query ItemsDelProject($id: ID!, $cursor: String) {
           }
           content {
             __typename
-            ... on Issue { id number title body url repository { nameWithOwner } }
+            ... on Issue {
+              id number title body url
+              repository { nameWithOwner }
+              comments { totalCount }
+              closedByPullRequestsReferences(first: 3, includeClosedPrs: true) {
+                nodes {
+                  number
+                  state
+                  isDraft
+                  mergeable
+                  commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+                }
+              }
+            }
           }
         }
       }
@@ -233,6 +287,68 @@ async def gh_graphql(consulta: str, **variables: str) -> dict:
     return json.loads(crudo or "{}").get("data") or {}
 
 
+#: Orden en que se elige QUÉ PR representa a la tarea cuando el issue tiene varios.
+#: También es el conjunto de estados válidos: cualquier otro se descarta.
+PRIORIDAD_PR: tuple[str, ...] = ("open", "draft", "merged", "closed")
+
+#: `statusCheckRollup.state` (enum StatusState de GitHub) mapeado a lo que la UI
+#: distingue. Lo que no esté acá -EXPECTED, PENDING- cae en "pending"; el rollup
+#: AUSENTE es otra cosa y se marca "none": un PR sin un solo check no está corriendo
+#: nada, así que no tiene sentido hacerle esperar el «ready to merge».
+_CI_POR_ROLLUP = {"SUCCESS": "success", "FAILURE": "failure", "ERROR": "failure"}
+
+
+@dataclass(frozen=True)
+class PrVinculado:
+    """El PR que cerraría el issue (`Closes #N`), resumido para la fila y el detalle."""
+
+    numero: int
+    estado: str  # uno de PRIORIDAD_PR
+    ci: str  # "success" | "failure" | "pending" | "none"
+    #: GitHub confirma que se puede mergear. Falso también mientras lo calcula
+    #: (`UNKNOWN`), así que solo sirve para AFIRMAR que está listo, nunca para negarlo.
+    mergeable: bool = False
+
+    @property
+    def listo(self) -> bool:
+        """Mergeable ya: abierto, fuera de draft, sin CI roja ni conflictos."""
+        return self.estado == "open" and self.ci in {"success", "none"} and self.mergeable
+
+
+def _pr_de_nodo(nodo: dict) -> PrVinculado | None:
+    """Un nodo de `closedByPullRequestsReferences`; None si no se entiende."""
+    numero = int(nodo.get("number") or 0)
+    estado = str(nodo.get("state") or "").casefold()
+    if estado == "open" and nodo.get("isDraft"):
+        estado = "draft"
+    if not numero or estado not in PRIORIDAD_PR:
+        return None
+    commits = (nodo.get("commits") or {}).get("nodes") or []
+    rollup = ((commits[0] if commits else {}).get("commit") or {}).get("statusCheckRollup")
+    return PrVinculado(
+        numero=numero,
+        estado=estado,
+        ci=_CI_POR_ROLLUP.get(str((rollup or {}).get("state") or ""), "pending")
+        if rollup
+        else "none",
+        mergeable=str(nodo.get("mergeable") or "") == "MERGEABLE",
+    )
+
+
+def _pr_principal(nodos: list[dict]) -> PrVinculado | None:
+    """El PR que representa a la tarea: primero el trabajo vivo, después la historia.
+
+    Un issue acumula varios PRs con facilidad (un intento cerrado y el bueno), y la API
+    no promete orden. Elegir por estado -abierto antes que draft, y cualquiera de los
+    dos antes que uno ya cerrado- es lo que hace que el chip hable del PR que el usuario
+    está esperando. A igual estado gana el más nuevo.
+    """
+    prs = [pr for pr in map(_pr_de_nodo, nodos) if pr is not None]
+    if not prs:
+        return None
+    return min(prs, key=lambda pr: (PRIORIDAD_PR.index(pr.estado), -pr.numero))
+
+
 @dataclass(frozen=True)
 class Tarea:
     item_id: str
@@ -247,6 +363,12 @@ class Tarea:
     #: (1,06 s contra 0,45 s). Vacío en una tarea que venga de un caché viejo: ahí
     #: `Backend.cerrar` cae al camino de siempre.
     issue_id: str = ""
+    #: PR que cerraría el issue, o None si nadie lo empezó. Llega en la MISMA consulta
+    #: que lista el Project, así que el chip no cuesta ni un viaje extra.
+    pr: PrVinculado | None = None
+    #: Comentarios del issue: la conversación que la TUI no muestra pero conviene saber
+    #: que existe (el usuario escribe la spec y después la discute en GitHub).
+    comentarios: int = 0
 
     @property
     def cliente(self) -> str:
@@ -367,6 +489,61 @@ def fecha_larga(vence: date | None, hoy: date) -> str:
     return f"{vence.strftime('%d-%m-%Y')} · {cola}"
 
 
+# Chip del PR vinculado: un número y UN glifo. Contesta de un vistazo las dos únicas
+# preguntas que se hacen sobre una fila con PR -¿cuál es? y ¿está sano?- y no gasta ni
+# un carácter en el matiz, que se lee con palabras en el detalle (`resumen_pr`).
+#
+# El estado del PR manda sobre el de la CI porque en uno ya mergeado o cerrado la CI no
+# dice nada accionable. Colores: los mismos que el resto de la app -verde éxito, rojo
+# error, color 7 para lo secundario (ver SECUNDARIO)-, nunca `dim`.
+_CHIP_POR_ESTADO: dict[str, tuple[str, str | Style]] = {
+    "merged": ("✓", "green"),
+    "closed": ("✗", "bold red"),
+    "draft": ("·", SECUNDARIO),
+}
+_CHIP_POR_CI: dict[str, tuple[str, str | Style]] = {
+    "success": ("✓", "green"),
+    "failure": ("✗", "bold red"),
+}
+
+_CI_EN_PALABRAS = {
+    "success": "CI passing",
+    "failure": "CI failing",
+    "pending": "CI running",
+    "none": "no checks",
+}
+_ESTADO_EN_PALABRAS = {
+    "open": "open",
+    "draft": "draft",
+    "merged": "merged",
+    "closed": "closed unmerged",
+}
+
+
+def chip_pr(pr: PrVinculado | None) -> tuple[str, str | Style]:
+    """(texto, estilo) del indicador de PR de la lista; `("", "")` si no hay PR.
+
+    Sin PR no devuelve nada a propósito: la mayoría de las tareas no tiene uno y la
+    lista no debe pagar ruido -ni columnas- por una minoría de filas.
+    """
+    if pr is None:
+        return "", ""
+    glifo, estilo = (
+        _CHIP_POR_ESTADO.get(pr.estado) or _CHIP_POR_CI.get(pr.ci) or ("·", SECUNDARIO)
+    )
+    return f"#{pr.numero}{glifo}", estilo
+
+
+def resumen_pr(pr: PrVinculado) -> str:
+    """Línea del detalle: dice con palabras lo que el chip resume en un glifo."""
+    partes = [f"PR #{pr.numero}", _ESTADO_EN_PALABRAS.get(pr.estado, pr.estado)]
+    if pr.estado in {"open", "draft"}:
+        partes.append(_CI_EN_PALABRAS.get(pr.ci, pr.ci))
+    if pr.listo:
+        partes.append("ready to merge")
+    return " · ".join(partes)
+
+
 def acortar(texto: str, ancho: int) -> str:
     """Trunca con puntos suspensivos: el ancho del pane manda, nada desborda."""
     if ancho <= 0:
@@ -393,6 +570,31 @@ class Instantanea:
     cerradas: set[str] = field(default_factory=set)
 
 
+def _pr_a_dict(pr: PrVinculado | None) -> dict | None:
+    if pr is None:
+        return None
+    return {"numero": pr.numero, "estado": pr.estado, "ci": pr.ci, "mergeable": pr.mergeable}
+
+
+def _pr_de_dict(crudo: object) -> PrVinculado | None:
+    """None ante cualquier entrada rara, igual que `_tarea_de_dict`.
+
+    Una tarea guardada por una versión anterior no trae la clave: el chip aparece recién
+    con el primer refresco, que es exactamente lo que pasa con cualquier dato nuevo.
+    """
+    if not isinstance(crudo, dict):
+        return None
+    try:
+        return PrVinculado(
+            numero=int(crudo["numero"]),
+            estado=str(crudo["estado"]),
+            ci=str(crudo["ci"]),
+            mergeable=bool(crudo.get("mergeable")),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _tarea_a_dict(tarea: Tarea) -> dict:
     return {
         "item_id": tarea.item_id,
@@ -404,6 +606,8 @@ def _tarea_a_dict(tarea: Tarea) -> dict:
         "vence": tarea.vence.isoformat() if tarea.vence else None,
         "repeat": tarea.repeat,
         "issue_id": tarea.issue_id,
+        "pr": _pr_a_dict(tarea.pr),
+        "comentarios": tarea.comentarios,
     }
 
 
@@ -422,6 +626,8 @@ def _tarea_de_dict(crudo: object) -> Tarea | None:
             vence=parsear_fecha(crudo.get("vence")),
             repeat=str(crudo["repeat"]) if crudo.get("repeat") else None,
             issue_id=str(crudo.get("issue_id") or ""),
+            pr=_pr_de_dict(crudo.get("pr")),
+            comentarios=int(crudo.get("comentarios") or 0),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -639,6 +845,8 @@ class Backend:
                     vence=parsear_fecha(valor_campo(item, campo)),
                     repeat=repeat,
                     issue_id=contenido.get("id", ""),
+                    pr=_pr_principal(contenido.get("prs") or []),
+                    comentarios=int(contenido.get("comments") or 0),
                 )
             )
         ordenadas = ordenar(tareas)
@@ -807,6 +1015,10 @@ def _aplanar_item(nodo: dict) -> dict:
             "url": contenido.get("url", ""),
             "repository": (contenido.get("repository") or {}).get("nameWithOwner", ""),
             "id": contenido.get("id", ""),
+            # Dos claves que `gh project item-list` no daba (por eso no hay forma vieja
+            # que respetar): los PRs que cerrarían el issue y sus comentarios.
+            "comments": (contenido.get("comments") or {}).get("totalCount", 0),
+            "prs": (contenido.get("closedByPullRequestsReferences") or {}).get("nodes") or [],
         },
     }
     for valor in (nodo.get("fieldValues") or {}).get("nodes") or []:
@@ -845,6 +1057,16 @@ _DEMO = (
     (9, "mesa/intranet", "Review permissions by user role", None, None),
 )
 
+# PR vinculado y comentarios de algunas tareas de la demo, por número de issue: las
+# capturas del README enseñan así el chip en sus tres formas -verde, roja y en curso- y
+# las otras cuatro filas siguen mostrando que sin PR no hay ruido.
+_DEMO_PR: dict[int, PrVinculado] = {
+    48: PrVinculado(numero=112, estado="open", ci="failure", mergeable=True),
+    3: PrVinculado(numero=87, estado="open", ci="success", mergeable=True),
+    21: PrVinculado(numero=9, estado="draft", ci="pending", mergeable=False),
+}
+_DEMO_COMENTARIOS: dict[int, int] = {48: 3, 12: 1}
+
 
 class BackendDemo(Backend):
     """Datos ficticios: alimenta las capturas del README y las pruebas."""
@@ -865,6 +1087,8 @@ class BackendDemo(Backend):
                     cuerpo="Sample request for the demo.\n\n- Detail one\n- Detail two",
                     vence=None if dias is None else hoy + timedelta(days=dias),
                     repeat=repeat,
+                    pr=_DEMO_PR.get(numero),
+                    comentarios=_DEMO_COMENTARIOS.get(numero, 0),
                 )
                 for numero, repo, titulo, dias, repeat in _DEMO
             ]

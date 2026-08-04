@@ -1934,3 +1934,164 @@ async def test_cerrar_una_naciente_la_saca_de_la_lista():
         screen.refrescar()
         await pilot.pause(0.2)
         assert not any(t.titulo == "Nueva del cliente" for t in screen.tareas)
+
+
+# ------------------------------------------------------------------ chip de PR vinculado
+def _fila_de(screen, numero: int) -> int:
+    """Índice de fila de la tarea con ese número de issue."""
+    return next(i for i, t in enumerate(screen.visibles) if t.numero == numero)
+
+
+def _celda_titulo(screen, numero: int):
+    tabla = screen.query_one("#tabla", TablaTareas)
+    return tabla.get_cell_at(Coordinate(_fila_de(screen, numero), 3))
+
+
+async def _abrir_detalle(pilot, screen, numero: int):
+    screen.query_one("#tabla", TablaTareas).cursor_coordinate = Coordinate(
+        _fila_de(screen, numero), 0
+    )
+    await pilot.press("enter")
+    await pilot.pause()
+    return pilot.app.screen
+
+
+def _actividad(pantalla) -> str:
+    lineas = pantalla.query("#det-actividad")
+    return str(lineas.first().content) if lineas else ""
+
+
+async def test_el_chip_del_pr_resume_estado_y_ci_en_un_glifo():
+    """La demo trae los tres casos: CI verde, CI roja y draft (ver `_DEMO_PR`)."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+
+        assert _celda_titulo(screen, 3).plain.endswith("#87✓")  # abierto, CI verde
+        assert _celda_titulo(screen, 48).plain.endswith("#112✗")  # abierto, CI roja
+        assert _celda_titulo(screen, 21).plain.endswith("#9·")  # draft
+
+
+async def test_una_tarea_sin_pr_no_paga_ningun_ruido():
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        sin_pr = [t.numero for t in screen.visibles if t.pr is None]
+
+        assert sin_pr, "la demo tiene que traer tareas sin PR o el test no prueba nada"
+        for numero in sin_pr:
+            celda = _celda_titulo(screen, numero)
+            assert "#" not in celda.plain
+            assert not celda.spans, "una fila sin PR no lleva ni un estilo de chip"
+
+
+async def test_el_chip_usa_verde_de_exito_y_rojo_de_error():
+    """Doctrina de color de la app: verde/rojo ANSI y color 7 (SECUNDARIO) para lo
+    secundario. Nunca `dim`, que en esta paleta no llega al contraste mínimo."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        estilo = {n: _celda_titulo(screen, n).spans[-1].style for n in (3, 48, 21)}
+
+        assert estilo[3] == "green"
+        assert estilo[48] == "bold red"
+        assert estilo[21] == datos.SECUNDARIO
+        assert "dim" not in str(estilo.values())
+
+
+@pytest.mark.parametrize("size", TAMANOS)
+async def test_los_chips_quedan_alineados_y_ninguno_desborda_su_columna(size):
+    """El chip va pegado al borde derecho de la columna elástica: sin columna propia
+    (que la pagarían TODAS las filas) pero igual alineado entre sí."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=size) as pilot:
+        screen = await _listo(pilot)
+        tabla = screen.query_one("#tabla", TablaTareas)
+        ancho = tabla.columns[list(tabla.columns)[3]].width
+        con_chip = [
+            tabla.get_cell_at(Coordinate(fila, 3)).plain
+            for fila, tarea in enumerate(screen.visibles)
+            if tarea.pr is not None
+        ]
+
+        assert con_chip
+        assert all(len(celda) == ancho for celda in con_chip), con_chip
+        assert all(
+            len(tabla.get_cell_at(Coordinate(fila, 3)).plain) <= ancho
+            for fila in range(len(screen.visibles))
+        )
+
+
+async def test_sin_lugar_para_el_titulo_el_chip_cede():
+    """En una columna tan angosta que el chip se la comería entera, gana el título: una
+    fila que solo dijera «#112✗» no comunica de qué tarea habla."""
+    tarea = BackendDemo()._tareas[0]
+    con_pr = replace(tarea, pr=datos.PrVinculado(numero=112, estado="open", ci="failure"))
+
+    assert "#112" not in ListaScreen._celda_titulo(con_pr, 6).plain
+    assert ListaScreen._celda_titulo(con_pr, 30).plain.endswith("#112✗")
+
+
+async def test_el_detalle_dice_con_palabras_lo_que_el_chip_resume():
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+
+        assert _actividad(await _abrir_detalle(pilot, screen, 3)) == (
+            "PR #87 · open · CI passing · ready to merge"
+        )
+        await pilot.press("escape")
+        assert "PR #112 · open · CI failing" in _actividad(
+            await _abrir_detalle(pilot, screen, 48)
+        )
+        await pilot.press("escape")
+        assert _actividad(await _abrir_detalle(pilot, screen, 21)) == (
+            "PR #9 · draft · CI running"
+        )
+
+
+async def test_el_detalle_cuenta_los_comentarios_del_issue():
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+
+        assert _actividad(await _abrir_detalle(pilot, screen, 48)).endswith("3 comments")
+        await pilot.press("escape")
+        # Sin PR pero con conversación: la línea existe igual, y en singular.
+        assert _actividad(await _abrir_detalle(pilot, screen, 12)) == "1 comment"
+
+
+async def test_sin_pr_ni_comentarios_el_detalle_no_gasta_una_fila():
+    """En un pane de 15 filas, una línea vacía es una línea menos de descripción."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(80, 15)) as pilot:
+        screen = await _listo(pilot)
+        detalle = await _abrir_detalle(pilot, screen, 31)
+
+        assert not detalle.query("#det-actividad")
+
+
+@pytest.mark.parametrize(
+    ("pr", "esperado"),
+    [
+        (datos.PrVinculado(7, "merged", "success"), "PR #7 · merged"),
+        (datos.PrVinculado(7, "closed", "failure"), "PR #7 · closed unmerged"),
+        (datos.PrVinculado(7, "open", "none", True), "PR #7 · open · no checks · ready to merge"),
+        (datos.PrVinculado(7, "open", "success"), "PR #7 · open · CI passing"),
+    ],
+)
+async def test_el_resumen_del_detalle_separa_el_estado_del_pr_del_de_la_ci(pr, esperado):
+    """Lo que el glifo no puede distinguir -mergeado contra CI verde, cerrado contra CI
+    roja- acá se dice con palabras, que es para lo que el detalle tiene lugar."""
+    assert datos.resumen_pr(pr) == esperado
+
+
+@pytest.mark.parametrize("size", TAMANOS)
+async def test_la_linea_de_actividad_no_estira_el_detalle_fuera_de_la_pantalla(size):
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=size) as pilot:
+        screen = await _listo(pilot)
+        detalle = await _abrir_detalle(pilot, screen, 48)  # trae PR y comentarios
+
+        assert detalle.query("#det-actividad")
+        assert detalle.query_one("#dlg-detalle").outer_size.height <= size[1]
