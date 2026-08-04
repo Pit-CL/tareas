@@ -130,6 +130,10 @@ shows that repo's `owner/name` instead.
 
 **With the keyboard**
 
+Every button carries its own shortcut in its label (`[x·close task]`, `[^s·save]`),
+so there's nothing to memorise: whatever you can click, you can also type. `esc`
+always cancels or goes back, and it's spelled out in each dialog's hint line.
+
 | Key | Where | Action |
 |---|---|---|
 | `↑` `↓` (or `k` `j`) | list | Move the selection |
@@ -142,16 +146,28 @@ shows that repo's `owner/name` instead.
 | `g` / `G` | list | Jump to the first / last task |
 | `q` | list | Quit |
 | `j` / `k` | detail | Scroll the body |
+| `x` | detail | Close the task (same key as in the list) |
+| `d` | detail | Change the due date |
 | `1`–`5` | new task, due date | Quick-pick a due date |
 | `enter` | new task | Jump to the next field |
-| `ctrl+enter` (or `ctrl+s`) | new task, due date | Create / save, from any field |
+| `ctrl+s` | new task, due date | Create / save, from any field |
+| `ctrl+x` | due date | Clear the due date |
 | `ctrl+r` | new task | Cycle the recurrence |
+| `ctrl+p` | new task | Pick a different repo (repo mode) |
 | `y` / `n` | confirmation | Confirm / cancel |
 | `esc` | any dialog | Close it |
 
-`ctrl+enter` needs a terminal that speaks the [kitty keyboard
-protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) (kitty, WezTerm,
-Ghostty, foot…). `ctrl+s` does the same thing everywhere else.
+Dialogs use `ctrl+`*letter* and plain letters use themselves: inside a dialog with
+a text field, Textual lets the field keep every printable character before any
+binding sees it, so a bare letter would end up typed instead of firing. The detail
+has no text field, which is why `x` and `d` work there exactly as in the list.
+
+`ctrl+enter` also creates and saves, but only on terminals that speak the [kitty
+keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) end to end
+(kitty, WezTerm, Ghostty, foot… and *not* through tmux or ssh without it). It is
+deliberately never advertised in the UI: everywhere else the terminal sends the
+same byte for `enter` and `ctrl+enter`, so it would be a shortcut that does
+nothing. `ctrl+s` always works.
 
 The list reloads itself every 5 minutes; the header shows how long ago it last
 updated. The selection follows the *task*, not the row number: when a reload
@@ -177,15 +193,21 @@ toggles to the full list and back; outside a repo, the toggle doesn't appear.
 ![Repo mode](docs/repo-mode.png)
 
 Creating a task (`n`) in repo mode preselects that repo without opening the
-repo picker — it only asks for a title, notes and a date. If you'd rather pick a
-different repo, click the fixed repo label to reveal the normal picker.
+repo picker — it only asks for a title, a description and a date. If you'd rather
+pick a different repo, click the fixed repo label (or press `ctrl+p`) to reveal the
+normal picker.
 
 ### Creating a task
 
-The new-task dialog asks for a repo, a title, optional *notes* (they become the
-issue body — leave them empty and the issue has no body), an optional due date and
-an optional recurrence. `enter` walks the fields one by one; `ctrl+enter` creates
-from wherever you are.
+The new-task dialog asks for a repo, a **title**, an optional **description** (it
+becomes the issue body — leave it empty and the issue has no body), an optional due
+date and an optional recurrence. `enter` walks the fields one by one; `ctrl+s`
+creates from wherever you are.
+
+Both text fields are one line tall and sit one on top of the other, so each one
+says what it is right in its placeholder (`title · …`, `description · …`) and shows
+a vertical bar on its left marking where you can type — accented on the field that
+has the focus.
 
 | Roomy (110×24) | Compact (80×15) |
 |---|---|

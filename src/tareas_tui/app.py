@@ -17,6 +17,7 @@ import functools
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import date, datetime, timedelta
+from time import monotonic
 
 from rich.style import Style
 from rich.text import Text
@@ -55,6 +56,13 @@ from .datos import (
 REFRESCO_SEGUNDOS = 300.0
 ANCHO_CLIENTE_MAX = 22
 ANCHO_CLIENTE_MIN = 10
+# Cuánto se sostiene en la lista una tarea recién creada que el Project todavía no
+# devuelve. Medido contra el Project real: un item recién agregado tarda entre 4 y 6
+# segundos en aparecer en la lectura (da igual el camino: `gh project item-list` tiene
+# el mismo retardo). El refresco que dispara el alta llega antes que eso, así que sin
+# esta ventana la fila aparecía y se borraba sola al segundo. 120 s es techo de sobra
+# y a la vez garantiza que una tarea que GitHub nunca devuelva no se quede pegada.
+VIDA_NACIENTES = 120.0
 # Filas de pantalla desde las que los modales respiran. El corte no es estético: el
 # modal más alto (nueva tarea, con el picker desplegado) mide 21 filas holgado, así que
 # 22 es el primer alto donde entra entero con margen. Debajo, layout compacto.
@@ -294,11 +302,18 @@ class DialogoModal(ModalScreen):
 # Modales
 # ------------------------------------------------------------------------------------
 class DetalleScreen(DialogoModal):
-    """Detalle del issue. Devuelve 'cerrar', 'fecha' o None."""
+    """Detalle del issue. Devuelve 'cerrar', 'fecha' o None.
+
+    Los atajos son los MISMOS que en la lista (`x` cierra, `d` fecha): acá no hay
+    ningún Input que se coma las letras, así que el gesto no cambia según dónde
+    estés parado.
+    """
 
     BINDINGS = [
         Binding("j", "abajo", "", show=False),
         Binding("k", "arriba", "", show=False),
+        Binding("x", "cerrar_tarea", "", show=False),
+        Binding("d", "cambiar_fecha", "", show=False),
     ]
 
     def __init__(self, tarea: Tarea) -> None:
@@ -318,16 +333,26 @@ class DetalleScreen(DialogoModal):
                 yield Markdown(self.tarea.cuerpo or "_(no description)_")
             yield Static("", classes="respiro")
             with Horizontal(classes="fila-botones"):
-                yield Button("\\[close task]", id="det-cerrar", classes="chip peligro")
-                yield Button("\\[change date]", id="det-fecha", classes="chip")
+                yield Button("\\[x·close task]", id="det-cerrar", classes="chip peligro")
+                yield Button("\\[d·change date]", id="det-fecha", classes="chip")
                 yield Button("\\[back]", id="det-volver", classes="chip secundario")
-            yield Static("j/k scroll · esc back", id="det-hint", classes="hint")
+            yield Static(
+                "x close · d date · j/k scroll · esc back", id="det-hint", classes="hint"
+            )
 
-    def _meta(self) -> str:
-        partes = [self.tarea.cliente, fecha_larga(self.tarea.vence, date.today())]
+    def _meta(self) -> Text:
+        """Cliente · vencimiento · repetición, con el vencimiento en su color semántico.
+
+        Misma jerarquía que la columna de la lista (vencida en rojo, hoy en acento,
+        lejana en color 7): abrir el detalle no debería perder el dato que más se mira.
+        Lo que no lleva estilo hereda el `$accent` que el CSS le pone a `#det-meta`.
+        """
+        hoy = date.today()
+        _, estilo = etiqueta_vencimiento(self.tarea.vence, hoy)
+        partes = [Text(self.tarea.cliente), Text(fecha_larga(self.tarea.vence, hoy), estilo)]
         if self.tarea.repeat:
-            partes.append(f"↻ repeats {self.tarea.repeat}")
-        return " · ".join(partes)
+            partes.append(Text(f"↻ repeats {self.tarea.repeat}"))
+        return Text(" · ").join(partes)
 
     def al_montar(self) -> None:
         self.query_one("#det-cuerpo").focus()
@@ -351,14 +376,29 @@ class DetalleScreen(DialogoModal):
     def action_arriba(self) -> None:
         self.query_one("#det-cuerpo", VerticalScroll).scroll_up()
 
+    def action_cerrar_tarea(self) -> None:
+        self.dismiss("cerrar")
+
+    def action_cambiar_fecha(self) -> None:
+        self.dismiss("fecha")
+
 
 class FechaScreen(DialogoModal):
-    """Elegir vencimiento. Devuelve 'AAAA-MM-DD', '' para quitarlo, o None."""
+    """Elegir vencimiento. Devuelve 'AAAA-MM-DD', '' para quitarlo, o None.
+
+    Todo lo que no sea un quick-pick va con `ctrl+letra`: hay un Input con el foco y
+    Textual deja que se quede con cualquier tecla imprimible antes que un binding,
+    por prioritario que sea. `ctrl+enter` queda de bonus para quien tenga el protocolo
+    de teclado de Kitty de punta a punta, pero NUNCA se anuncia (ver el hint).
+    """
 
     BINDINGS = [
         Binding(str(i), f"quick_pick({i})", "", show=False, priority=True)
         for i in range(1, 6)
-    ] + [Binding("ctrl+enter,ctrl+s", "guardar", "", show=False, priority=True)]
+    ] + [
+        Binding("ctrl+enter,ctrl+s", "guardar", "", show=False, priority=True),
+        Binding("ctrl+x", "quitar", "", show=False, priority=True),
+    ]
 
     def __init__(self, titulo: str, actual: date | None) -> None:
         super().__init__()
@@ -377,12 +417,14 @@ class FechaScreen(DialogoModal):
                     placeholder="YYYY-MM-DD",
                     id="fecha-input",
                 )
-                yield Button("\\[save]", id="fecha-guardar", classes="chip primario")
-                yield Button("\\[clear]", id="fecha-quitar", classes="chip peligro")
+                yield Button("\\[^s·save]", id="fecha-guardar", classes="chip primario")
+                yield Button("\\[^x·clear]", id="fecha-quitar", classes="chip peligro")
                 yield Button("\\[cancel]", id="fecha-cancelar", classes="chip secundario")
             yield Static("", id="fecha-error", classes="error-linea")
             yield Static(
-                "1-5 quick · ^enter save · esc cancel", id="fecha-hint", classes="hint"
+                "1-5 date · ^s save · ^x clear · esc cancel",
+                id="fecha-hint",
+                classes="hint",
             )
 
     def al_montar(self) -> None:
@@ -394,6 +436,9 @@ class FechaScreen(DialogoModal):
 
     def action_guardar(self) -> None:
         self._guardar()
+
+    def action_quitar(self) -> None:
+        self.dismiss("")
 
     def on_atajos_fecha_elegida(self, event: AtajosFecha.Elegida) -> None:
         event.stop()
@@ -446,6 +491,7 @@ class NuevaScreen(DialogoModal):
     ] + [
         Binding("ctrl+enter,ctrl+s", "crear", "", show=False, priority=True),
         Binding("ctrl+r", "ciclar_repeat", "", show=False, priority=True),
+        Binding("ctrl+p", "cambiar_repo", "", show=False, priority=True),
     ]
 
     def __init__(
@@ -466,14 +512,21 @@ class NuevaScreen(DialogoModal):
             yield Static("new task", classes="dlg-titulo")
             if self.repo_prefijado is not None:
                 yield BotonCabecera(
-                    f"\\[repo: {self.repo_prefijado}]", "cambiar-repo",
+                    f"\\[^p·repo: {self.repo_prefijado}]", "cambiar-repo",
                     id="nueva-repo-fijo", classes="chip",
                 )
             yield Input(placeholder="filter repo…", id="nueva-filtro")
             yield OptionList(id="nueva-repos")
             yield Static("", classes="respiro")
-            yield Input(placeholder="what did they ask for?", id="nueva-titulo")
-            yield Input(placeholder="notes (optional)", id="nueva-notas")
+            # Los placeholders nombran su campo ("title ·", "description ·") en vez de
+            # solo insinuarlo: dos Input de una fila, pegados y sin etiqueta, se leen
+            # como un párrafo y el segundo pasaba desapercibido. Y dice "description"
+            # -la palabra de GitHub- porque es la que la gente va a buscar.
+            yield Input(placeholder="title · what did they ask for?", id="nueva-titulo")
+            yield Input(
+                placeholder="description · notes, links, context (optional)",
+                id="nueva-notas",
+            )
             yield Static("", classes="respiro")
             yield AtajosFecha(classes="fila-chips")
             with Horizontal(classes="fila-fecha"):
@@ -481,7 +534,7 @@ class NuevaScreen(DialogoModal):
                 yield Button(self._etiqueta_repeat(), id="nueva-repeat", classes="chip")
             yield Static("", classes="respiro")
             with Horizontal(classes="fila-botones"):
-                yield Button("\\[create]", id="nueva-crear", classes="chip primario")
+                yield Button("\\[^s·create]", id="nueva-crear", classes="chip primario")
                 yield Button("\\[cancel]", id="nueva-cancelar", classes="chip secundario")
             yield Static("", id="nueva-error", classes="error-linea")
             yield Static(
@@ -528,7 +581,14 @@ class NuevaScreen(DialogoModal):
         if event.accion != "cambiar-repo":
             return
         event.stop()
-        self.query_one("#nueva-repo-fijo").remove()
+        self.action_cambiar_repo()
+
+    def action_cambiar_repo(self) -> None:
+        """Revela el picker para elegir otro repo (solo aplica en modo repo)."""
+        fijo = self.query("#nueva-repo-fijo")
+        if not fijo:  # el picker ya está a la vista: no hay nada que revelar
+            return
+        fijo.remove()
         self.query_one("#nueva-filtro", Input).display = True
         self.query_one("#nueva-repos", OptionList).display = True
         self._filtrar()
@@ -563,7 +623,7 @@ class NuevaScreen(DialogoModal):
         largo del más largo, el chip nunca cambia de ancho -así que ni se corta ni
         hace bailar la fila al ciclar-.
         """
-        return f"↻ repeat: {self.repeticion:<{ANCHO_ETIQUETA_REPEAT}}"
+        return f"↻ ^r·repeat: {self.repeticion:<{ANCHO_ETIQUETA_REPEAT}}"
 
     def action_ciclar_repeat(self) -> None:
         siguiente = (REPETICIONES.index(self.repeticion) + 1) % len(REPETICIONES)
@@ -686,9 +746,9 @@ class ConfirmaScreen(DialogoModal):
             yield Static(self.pregunta, classes="dlg-titulo")
             yield Static("", classes="respiro")
             with Horizontal(classes="fila-botones"):
-                yield Button("\\[yes, close]", id="ok", classes="chip peligro")
-                yield Button("\\[cancel]", id="no", classes="chip secundario")
-            yield Static("y close · n cancel", id="confirma-hint", classes="hint")
+                yield Button("\\[y·yes, close]", id="ok", classes="chip peligro")
+                yield Button("\\[n·cancel]", id="no", classes="chip secundario")
+            yield Static("y close · n/esc cancel", id="confirma-hint", classes="hint")
 
     def al_montar(self) -> None:
         self.query_one("#no", Button).focus()
@@ -750,6 +810,12 @@ class ListaScreen(Screen):
         # proceso, reiniciar la app resucitaba la tarea desde el caché de disco y
         # cerrarla de nuevo creaba una SEGUNDA ocurrencia de la repetitiva en GitHub.
         self.cerradas: set[str] = set()
+        # El espejo de `cerradas`: item_id -> reloj monotónico del alta. Son tareas que
+        # se crearon desde acá y que el Project TODAVÍA no devuelve (ver
+        # VIDA_NACIENTES). Sin esto el refresco que dispara el alta pisaba la lista con
+        # una lectura que aún no las trae, y la fila recién creada desaparecía sola.
+        # No se persiste: para cuando la app reinicia, GitHub ya la devuelve.
+        self.nacientes: dict[str, float] = {}
         self.aviso_campo_dado = False
 
     def compose(self) -> ComposeResult:
@@ -817,7 +883,9 @@ class ListaScreen(Screen):
             self.cerradas &= {t.item_id for t in llegadas}
             if self.cerradas != previas:  # el refresco corre cada 5 min: no reescribir por nada
                 self._recordar_cerradas()
-            self.tareas = [t for t in llegadas if t.item_id not in self.cerradas]
+            self.tareas = self._conservar_nacientes(
+                [t for t in llegadas if t.item_id not in self.cerradas]
+            )
             self.ultimo_ok = datetime.now()
             self.ultimo_error = None
             self._avisar_limite()
@@ -832,6 +900,34 @@ class ListaScreen(Screen):
     def _recordar_cerradas(self) -> None:
         """Baja el set de cerradas al disco, junto al caché de la lista."""
         self.backend.recordar_cerradas(self.cerradas)
+
+    def _nacer(self, tarea: Tarea) -> None:
+        """Marca una tarea recién creada para que el próximo refresco no se la lleve."""
+        self.nacientes[tarea.item_id] = monotonic()
+
+    def _conservar_nacientes(self, llegadas: list[Tarea]) -> list[Tarea]:
+        """Vuelve a meter en la lista las recién creadas que el Project aún no manda.
+
+        Se deja de sostener una tarea en cuanto GitHub empieza a devolverla (que es lo
+        normal, a los pocos segundos) o cuando se pasó de `VIDA_NACIENTES`: así una
+        tarea que por lo que sea no vuelva nunca no se queda pegada para siempre.
+
+        La fila que se conserva es la de `self.tareas` y no la que se guardó al crearla,
+        para no perder lo que el usuario le haya hecho mientras tanto (fecharla, p.ej.).
+        """
+        traidas = {t.item_id for t in llegadas}
+        limite = monotonic() - VIDA_NACIENTES
+        self.nacientes = {
+            item_id: nacimiento
+            for item_id, nacimiento in self.nacientes.items()
+            if item_id not in traidas and nacimiento > limite
+        }
+        if not self.nacientes:
+            return llegadas
+        conocidas = {t.item_id: t for t in self.tareas}
+        return ordenar(
+            [*llegadas, *(conocidas[i] for i in self.nacientes if i in conocidas)]
+        )
 
     def _avisar_campo(self) -> None:
         """Rompe el silencio cuando el campo de fecha ya no se llama como dice la config.
@@ -1206,6 +1302,7 @@ class ListaScreen(Screen):
             self.notify(f"couldn't create the task: {err}", severity="error", timeout=6)
             return
         if creada is not None:
+            self._nacer(creada)
             self._aplicar([*self.tareas, creada])
         self.notify("task created", timeout=3)
         self.refrescar()
@@ -1281,6 +1378,7 @@ class ListaScreen(Screen):
             self.notify(f"couldn't close the task: {err}", severity="error", timeout=6)
             return
         self.cerradas.add(tarea.item_id)
+        self.nacientes.pop(tarea.item_id, None)  # cerrar gana sobre sostenerla
         self._recordar_cerradas()
         self._aplicar([t for t in self.tareas if t.item_id != tarea.item_id])
         self.notify(f"closed {tarea.cliente}", timeout=3)
@@ -1332,6 +1430,7 @@ class ListaScreen(Screen):
                 timeout=8,
             )
             return
+        self._nacer(siguiente)
         self._aplicar([*self.tareas, siguiente])
         self.notify(f"↻ next: {siguiente.vence.isoformat()}", timeout=4)
 
@@ -1411,10 +1510,13 @@ class TareasApp(App):
     #det-titulo { height: auto; max-height: 2; text-style: bold; }
     #det-meta { height: 1; color: $accent; }
     /* auto + max-height (que fija el modal según la pantalla) para que el cuerpo
-       abrace su contenido en vez de estirar el diálogo hasta el borde. */
+       abrace su contenido en vez de estirar el diálogo hasta el borde.
+       La regla que separa la meta del cuerpo va en ansi_white y no en $panel: $panel
+       es ansi_black, EL MISMO color que el fondo del diálogo ($surface), así que la
+       línea existía en el árbol pero no se veía en ninguna de las dos paletas. */
     #det-cuerpo {
         height: auto; min-height: 1; width: 100%; scrollbar-size-vertical: 1;
-        border-top: solid $panel;
+        border-top: solid ansi_white;
     }
 
     /* auto (no 1fr) para que la lista abrace a sus opciones y no deje hueco muerto;
@@ -1426,9 +1528,13 @@ class TareasApp(App):
     }
     .holgado #nueva-repos { max-height: 6; }
     /* border-left literal (marcador de "esto es un input"): a diferencia de
-       border-bottom, no consume una fila extra con height:1 (verificado). */
+       border-bottom, no consume una fila extra con height:1 (verificado).
+       En reposo va en ansi_white y no en ansi_default: con el color del fondo el
+       marcador era invisible, así que un Input sin foco no se distinguía de una
+       línea de texto -de ahí que el campo de notas pasara desapercibido-. Con foco
+       salta a ansi_yellow, así que se sigue viendo cuál está activo. */
     #nueva-filtro, #nueva-titulo, #nueva-notas, #nueva-fecha, #fecha-input {
-        height: 1; border: none; border-left: solid ansi_default; padding: 0 1;
+        height: 1; border: none; border-left: solid ansi_white; padding: 0 1;
         background: $background; width: 1fr;
     }
     #nueva-filtro:focus, #nueva-titulo:focus, #nueva-notas:focus,

@@ -9,11 +9,12 @@ siguiente ocurrencia).
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 
+import gh_falso
 import pytest
+from gh_falso import GhFalso
 from textual.coordinate import Coordinate
 from textual.widgets import Button, Input, OptionList
 
@@ -236,7 +237,17 @@ async def test_modales_con_hint_caben_en_pane_chico(size):
 
 
 @pytest.mark.parametrize("size", TAMANOS)
-@pytest.mark.parametrize("tecla,contenedor", [("n", "#dlg-nueva"), ("d", "#dlg-fecha")])
+@pytest.mark.parametrize(
+    "tecla,contenedor",
+    [
+        ("n", "#dlg-nueva"),
+        ("d", "#dlg-fecha"),
+        # Los 4 diálogos, no solo los dos con quick-picks: los botones llevan su atajo
+        # en el label ("[x·close task]"), así que cualquiera puede pasarse de fila.
+        ("enter", "#dlg-detalle"),
+        ("x", "#dlg-confirma"),
+    ],
+)
 async def test_ningun_chip_se_sale_de_su_fila(size, tecla, contenedor):
     """En 80x15 el último quick-pick se comía el borde del diálogo."""
     app = TareasApp(BackendDemo())
@@ -1187,7 +1198,7 @@ async def test_los_placeholders_de_los_inputs_se_leen():
         for selector, aguja in (
             ("#nueva-filtro", "ilter repo"),
             ("#nueva-titulo", "what did they ask for?"),
-            ("#nueva-notas", "notes (optional)"),
+            ("#nueva-notas", "notes, links, context (optional)"),
             ("#nueva-fecha", "YYYY-MM-DD (optional)"),
         ):
             campo = modal.query_one(selector, Input)
@@ -1508,39 +1519,25 @@ def _gh_project_zombi(repeat: str | None = None, creados: list | None = None):
     """
     cuerpo = f"<!-- tareas:repeat={repeat} -->" if repeat else ""
 
-    async def falso(*args: str) -> str:
-        if args[:2] == ("project", "item-list"):
-            return json.dumps(
-                {
-                    "items": [
-                        {
-                            "id": "PVTI_1",
-                            "status": "Todo",
-                            "content": {
-                                "type": "Issue",
-                                "repository": "pit/web",
-                                "number": 1,
-                                "title": "Renew SSL",
-                                "url": "https://github.com/pit/web/issues/1",
-                                "body": cuerpo,
-                            },
-                            "due date": "2026-08-01",
-                        }
-                    ]
-                }
-            )
-        if args[:2] == ("issue", "create"):
-            numero = 100 + len(creados if creados is not None else [])
-            if creados is not None:
-                creados.append(numero)
-            return f"https://github.com/pit/web/issues/{numero}\n"
-        if args[:2] == ("project", "item-add"):
-            return "PVTI_nueva\n"
-        if args[:2] == ("repo", "list"):
-            return "[]"
-        return ""
+    def crear_issue(_variables) -> str:
+        numero = 100 + len(creados if creados is not None else [])
+        if creados is not None:
+            creados.append(numero)
+        return gh_falso.issue_creado(numero)
 
-    return falso
+    return GhFalso(
+        {
+            "ItemsDelProject": gh_falso.pagina(
+                [
+                    gh_falso.item(
+                        1, titulo="Renew SSL", cuerpo=cuerpo, fecha="2026-08-01"
+                    )
+                ]
+            ),
+            "CrearIssue": crear_issue,
+            "AgregarItem": gh_falso.item_agregado(),
+        }
+    )
 
 
 async def _cerrar_la_primera(pilot, screen) -> None:
@@ -1621,3 +1618,319 @@ async def test_repetir_no_crea_una_ocurrencia_que_ya_esta_en_la_lista():
 
         assert creadas == [], "creó una ocurrencia que ya existía"
         assert any("already exists" in m for m in _avisos(pilot.app))
+
+
+# ------------------------------------------------------------------ atajos por pantalla
+#: Mapa completo de atajos: cada modal, los labels de sus botones y su línea de hint.
+#: La regla es una sola —el atajo propio de cada botón va EN SU LABEL con «·», y `esc`
+#: (cancelar/volver, que vale en todos) vive en el hint—, así que este mapa es a la vez
+#: la documentación y la regresión: cambiar un label sin tocar el hint rompe el test.
+ATAJOS_ESPERADOS = {
+    "d": (
+        "#dlg-fecha",
+        ["1·today", "2·tomorrow", "3·+3 days", "4·next week", "5·+1 month",
+         "[^s·save]", "[^x·clear]", "[cancel]"],
+        "1-5 date · ^s save · ^x clear · esc cancel",
+    ),
+    "enter": (
+        "#dlg-detalle",
+        ["[x·close task]", "[d·change date]", "[back]"],
+        "x close · d date · j/k scroll · esc back",
+    ),
+    "x": (
+        "#dlg-confirma",
+        ["[y·yes, close]", "[n·cancel]"],
+        "y close · n/esc cancel",
+    ),
+}
+
+
+@pytest.mark.parametrize("tecla", list(ATAJOS_ESPERADOS))
+async def test_cada_boton_de_cada_modal_anuncia_su_atajo(tecla):
+    contenedor, labels, hint = ATAJOS_ESPERADOS[tecla]
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        await pilot.press(tecla)
+        await pilot.pause()
+        dialogo = pilot.app.screen.query_one(contenedor)
+        assert [str(b.label) for b in dialogo.query(Button)] == labels
+        assert str(dialogo.query_one(".hint").render()) == hint
+
+
+async def test_los_botones_de_nueva_anuncian_su_atajo():
+    """Aparte porque el chip de repetición se rellena a ancho fijo (ver
+    `_etiqueta_repeat`) y el label real trae los espacios de relleno."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        await pilot.press("n")
+        await pilot.pause()
+        dialogo = pilot.app.screen.query_one("#dlg-nueva")
+        labels = [str(b.label).rstrip() for b in dialogo.query(Button)]
+        assert labels == [
+            "1·today", "2·tomorrow", "3·+3 days", "4·next week", "5·+1 month",
+            "↻ ^r·repeat: none", "[^s·create]", "[cancel]",
+        ]
+        assert (
+            str(dialogo.query_one("#nueva-hint").render())
+            == "1-5 date · ^r repeat · ^s create · esc cancel"
+        )
+
+
+@pytest.mark.parametrize("hint_id,tecla", [("#fecha-hint", "d"), ("#nueva-hint", "n")])
+async def test_ningun_hint_promete_ctrl_enter(hint_id, tecla):
+    """`ctrl+enter` llega como un `\\r` indistinguible de enter en cualquier terminal sin
+    el protocolo de Kitty de punta a punta, así que el binding no dispara: anunciarlo
+    era prometer un atajo mudo. El que sí llega siempre es `ctrl+s`."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        await pilot.press(tecla)
+        await pilot.pause()
+        texto = str(pilot.app.screen.query_one(hint_id).render())
+        assert "^enter" not in texto
+        assert "^s" in texto
+
+
+async def test_el_detalle_cierra_la_tarea_con_x():
+    """Mismo atajo que en la lista: el gesto no cambia según dónde estés parado."""
+    backend = BackendDemo()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        tarea = screen.seleccionada
+        await pilot.press("enter")
+        await _esperar(pilot, lambda: isinstance(pilot.app.screen, DetalleScreen))
+        await pilot.press("x")
+        await _esperar(pilot, lambda: isinstance(pilot.app.screen, ConfirmaScreen))
+        await pilot.press("y")
+        await _esperar(pilot, lambda: tarea not in screen.tareas)
+
+        assert tarea not in screen.tareas
+
+
+async def test_el_detalle_abre_la_fecha_con_d():
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        await pilot.press("enter")
+        await _esperar(pilot, lambda: isinstance(pilot.app.screen, DetalleScreen))
+        await pilot.press("d")
+        await _esperar(pilot, lambda: isinstance(pilot.app.screen, FechaScreen))
+
+        assert isinstance(pilot.app.screen, FechaScreen)
+
+
+async def test_ctrl_x_limpia_el_vencimiento():
+    backend = BackendDemo()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        tarea = screen.seleccionada
+        assert tarea.vence is not None
+        await pilot.press("d")
+        await _esperar(pilot, lambda: isinstance(pilot.app.screen, FechaScreen))
+        await pilot.press("ctrl+x")
+        await _esperar(
+            pilot, lambda: screen.seleccionada is not None and not isinstance(
+                pilot.app.screen, FechaScreen
+            )
+        )
+        await pilot.pause(0.1)
+
+        actualizada = next(t for t in screen.tareas if t.item_id == tarea.item_id)
+        assert actualizada.vence is None
+
+
+async def test_ctrl_p_revela_el_picker_de_repos_en_modo_repo():
+    """En modo repo el picker arranca oculto: `^p` (o un clic en el chip) lo abre.
+    Va con ctrl porque hay Inputs con el foco comiéndose las letras sueltas."""
+    app = TareasApp(BackendDemo(repo_actual="vela/landing"))
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        await pilot.press("n")
+        await pilot.pause()
+        modal = pilot.app.screen
+        assert not modal.query_one("#nueva-repos", OptionList).display
+
+        await pilot.press("ctrl+p")
+        await pilot.pause()
+
+        assert modal.query_one("#nueva-repos", OptionList).display
+        assert not modal.query("#nueva-repo-fijo")
+
+
+async def test_ctrl_p_no_revienta_cuando_el_picker_ya_esta_a_la_vista():
+    """Fuera de modo repo no hay chip que quitar: el atajo tiene que ser inocuo."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        await pilot.press("n")
+        await pilot.pause()
+        await pilot.press("ctrl+p")
+        await pilot.pause()
+
+        assert isinstance(pilot.app.screen, NuevaScreen)
+        assert pilot.app.screen.query_one("#nueva-repos", OptionList).display
+
+
+# ------------------------------------------------------------------ campos visibles
+async def test_los_inputs_se_ven_como_campos_aunque_no_tengan_el_foco():
+    """El marcador iba en `ansi_default` -el color del fondo-, así que un Input sin foco
+    era indistinguible de una línea de texto: por eso el campo de notas pasaba
+    desapercibido. Sin foco va en color 7; con foco, en el acento."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        await pilot.press("n")
+        await pilot.pause()
+        modal = pilot.app.screen
+
+        for selector in ("#nueva-titulo", "#nueva-notas", "#nueva-fecha"):
+            tipo, color = modal.query_one(selector, Input).styles.border_left
+            assert tipo == "solid", selector
+            assert color.ansi == 7, (selector, color)
+
+        modal.query_one("#nueva-notas", Input).focus()
+        await pilot.pause()
+        _, color = modal.query_one("#nueva-notas", Input).styles.border_left
+        assert color.ansi == 3, color  # el acento marca cuál está activo
+
+
+async def test_el_detalle_separa_la_meta_del_cuerpo_con_una_regla_visible():
+    """Iba en `$panel`, que es ansi_black: EL MISMO color que el fondo del diálogo
+    ($surface), así que la línea estaba en el árbol y no se veía en ninguna paleta."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        await pilot.press("enter")
+        await _esperar(pilot, lambda: isinstance(pilot.app.screen, DetalleScreen))
+        cuerpo = pilot.app.screen.query_one("#det-cuerpo")
+        fondo = pilot.app.screen.query_one("#dlg-detalle").styles.background
+
+        tipo, color = cuerpo.styles.border_top
+        assert tipo == "solid"
+        assert color.ansi == 7
+        assert color.ansi != fondo.ansi
+
+
+async def test_el_vencimiento_del_detalle_conserva_su_color_semantico():
+    """La columna de la lista pinta las vencidas en rojo; abrir el detalle no debería
+    perder el dato que más se mira."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        # La lista viene ordenada por vencimiento: la primera es la más atrasada.
+        modal = DetalleScreen(screen.visibles[0])
+        atrasada = [s for s in modal._meta().render(pilot.app.console) if "overdue" in s.text]
+
+        assert atrasada
+        assert all(s.style.bold and s.style.color.name == "red" for s in atrasada)
+
+
+# ------------------------------------------------------------------ tareas recién nacidas
+class BackendCiego(BackendDemo):
+    """El Project todavía no devuelve lo que se acaba de crear.
+
+    Es el comportamiento REAL medido contra GitHub: un item recién agregado tarda
+    entre 4 y 6 segundos en salir en la lectura (mismo retardo por GraphQL que por
+    `gh project item-list`), y el refresco que dispara el alta llega mucho antes.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.invisibles: set[str] = set()
+
+    async def crear(self, repo, titulo, fecha, cuerpo=""):
+        creada = await super().crear(repo, titulo, fecha, cuerpo)
+        self.invisibles.add(creada.item_id)
+        return creada
+
+    async def listar(self):
+        return [t for t in await super().listar() if t.item_id not in self.invisibles]
+
+
+async def _crear_tarea(pilot, titulo: str = "Nueva del cliente") -> None:
+    await pilot.press("n")
+    await pilot.pause()
+    modal = pilot.app.screen
+    modal.query_one("#nueva-titulo", Input).value = titulo
+    modal.query_one("#nueva-crear", Button).press()
+    await pilot.pause()
+
+
+async def test_una_tarea_recien_creada_no_desaparece_con_el_refresco_del_alta():
+    """El síntoma que el usuario veía como «tuve que reiniciar la app»: la fila
+    aparecía y al segundo se borraba sola, porque el refresco pisaba la lista con una
+    lectura que GitHub todavía no había puesto al día."""
+    backend = BackendCiego()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        await _crear_tarea(pilot)
+        await _esperar(pilot, lambda: any(t.titulo == "Nueva del cliente" for t in screen.tareas))
+
+        # el refresco del alta ya corrió y el Project sigue sin devolverla
+        screen.refrescar()
+        await _esperar(pilot, lambda: screen.ultimo_ok is not None)
+        await pilot.pause(0.1)
+
+        assert [t.titulo for t in screen.tareas].count("Nueva del cliente") == 1
+
+
+async def test_la_naciente_se_suelta_en_cuanto_el_project_la_devuelve():
+    """Sostenerla de más la duplicaría: la lista la traería y nosotros también."""
+    backend = BackendCiego()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        await _crear_tarea(pilot)
+        await _esperar(pilot, lambda: screen.nacientes)
+
+        backend.invisibles.clear()  # GitHub ya la publica
+        screen.refrescar()
+        await _esperar(pilot, lambda: not screen.nacientes)
+        await pilot.pause(0.1)
+
+        assert [t.titulo for t in screen.tareas].count("Nueva del cliente") == 1
+        assert screen.nacientes == {}
+
+
+async def test_una_naciente_no_se_queda_pegada_para_siempre(monkeypatch):
+    """Si GitHub nunca la devuelve, la fila tiene que irse sola en vez de quedar como
+    un fantasma que ningún refresco puede sacar."""
+    monkeypatch.setattr("tareas_tui.app.VIDA_NACIENTES", 0.0)
+    backend = BackendCiego()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        await _crear_tarea(pilot)
+        await _esperar(pilot, lambda: not screen.nacientes)
+        await pilot.pause(0.1)
+
+        assert screen.nacientes == {}
+        assert not any(t.titulo == "Nueva del cliente" for t in screen.tareas)
+
+
+async def test_cerrar_una_naciente_la_saca_de_la_lista():
+    """Cerrar gana sobre sostenerla: si no, la cerrada volvería en cada refresco."""
+    backend = BackendCiego()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        await _crear_tarea(pilot)
+        await _esperar(pilot, lambda: screen.nacientes)
+
+        nueva = next(t for t in screen.tareas if t.titulo == "Nueva del cliente")
+        screen.query_one("#tabla", TablaTareas).cursor_coordinate = Coordinate(
+            screen.visibles.index(nueva), 0
+        )
+        await pilot.press("x")
+        await _esperar(pilot, lambda: isinstance(pilot.app.screen, ConfirmaScreen))
+        await pilot.press("y")
+        await _esperar(pilot, lambda: not screen.nacientes)
+
+        screen.refrescar()
+        await pilot.pause(0.2)
+        assert not any(t.titulo == "Nueva del cliente" for t in screen.tareas)
