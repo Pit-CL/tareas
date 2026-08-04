@@ -484,16 +484,20 @@ async def test_ctrl_s_tambien_crea():
 async def test_el_hint_de_nueva_no_promete_ctrl_enter():
     """`ctrl+enter` no es distinguible de `enter` en la mayoría de las terminales
     (sin el protocolo de teclado de Kitty de punta a punta llegan como el mismo
-    byte `\\r`), así que el hint no debe prometerlo: `ctrl+s` es el atajo que de
-    verdad dispara `crear` en cualquier terminal."""
+    byte `\\r`), así que ni el hint ni el botón deben prometerlo: `ctrl+s` es el
+    atajo que de verdad dispara `crear` en cualquier terminal, y hoy vive en el
+    label del botón (`[^s·create]`), no en el hint."""
     app = TareasApp(BackendDemo(repo_actual="vela/landing"))
     async with app.run_test() as pilot:
         await _listo(pilot)
         await pilot.press("n")
         await pilot.pause()
-        texto = str(pilot.app.screen.query_one("#nueva-hint").content)
-        assert "^s create" in texto
+        dialogo = pilot.app.screen
+        texto = str(dialogo.query_one("#nueva-hint").content)
+        labels = " ".join(str(b.label) for b in dialogo.query(Button))
+        assert "^s·create" in labels
         assert "^enter" not in texto
+        assert "^enter" not in labels
 
 
 async def test_ctrl_enter_crea_desde_cualquier_campo():
@@ -1630,17 +1634,17 @@ ATAJOS_ESPERADOS = {
         "#dlg-fecha",
         ["1·today", "2·tomorrow", "3·+3 days", "4·next week", "5·+1 month",
          "[^s·save]", "[^x·clear]", "[cancel]"],
-        "1-5 date · ^s save · ^x clear · esc cancel",
+        "esc cancel",
     ),
     "enter": (
         "#dlg-detalle",
         ["[x·close task]", "[d·change date]", "[back]"],
-        "x close · d date · j/k scroll · esc back",
+        "j/k scroll · esc back",
     ),
     "x": (
         "#dlg-confirma",
         ["[y·yes, close]", "[n·cancel]"],
-        "y close · n/esc cancel",
+        "esc cancel",
     ),
 }
 
@@ -1672,25 +1676,26 @@ async def test_los_botones_de_nueva_anuncian_su_atajo():
             "1·today", "2·tomorrow", "3·+3 days", "4·next week", "5·+1 month",
             "↻ ^r·repeat: none", "[^s·create]", "[cancel]",
         ]
-        assert (
-            str(dialogo.query_one("#nueva-hint").render())
-            == "1-5 date · ^r repeat · ^s create · esc cancel"
-        )
+        assert str(dialogo.query_one("#nueva-hint").render()) == "esc cancel"
 
 
 @pytest.mark.parametrize("hint_id,tecla", [("#fecha-hint", "d"), ("#nueva-hint", "n")])
 async def test_ningun_hint_promete_ctrl_enter(hint_id, tecla):
     """`ctrl+enter` llega como un `\\r` indistinguible de enter en cualquier terminal sin
-    el protocolo de Kitty de punta a punta, así que el binding no dispara: anunciarlo
-    era prometer un atajo mudo. El que sí llega siempre es `ctrl+s`."""
+    el protocolo de Kitty de punta a punta, así que el binding no dispara: ni el hint
+    ni ningún botón deben anunciarlo. El que sí llega siempre es `ctrl+s`, y hoy vive
+    en el label del botón de guardar/crear (el hint ya no lo repite)."""
     app = TareasApp(BackendDemo())
     async with app.run_test(size=(110, 24)) as pilot:
         await _listo(pilot)
         await pilot.press(tecla)
         await pilot.pause()
-        texto = str(pilot.app.screen.query_one(hint_id).render())
-        assert "^enter" not in texto
-        assert "^s" in texto
+        dialogo = pilot.app.screen
+        texto_hint = str(dialogo.query_one(hint_id).render())
+        labels = " ".join(str(b.label) for b in dialogo.query(Button))
+        assert "^enter" not in texto_hint
+        assert "^enter" not in labels
+        assert "^s" in labels
 
 
 async def test_el_detalle_cierra_la_tarea_con_x():

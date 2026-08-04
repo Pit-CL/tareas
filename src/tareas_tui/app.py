@@ -344,7 +344,9 @@ class DetalleScreen(DialogoModal):
                 yield Button("\\[d·change date]", id="det-fecha", classes="chip")
                 yield Button("\\[back]", id="det-volver", classes="chip secundario")
             yield Static(
-                "x close · d date · j/k scroll · esc back", id="det-hint", classes="hint"
+                # x y d ya van en el label de su botón (`[x·close task]`,
+                # `[d·change date]`): repetirlos acá era la misma info dos veces.
+                "j/k scroll · esc back", id="det-hint", classes="hint"
             )
 
     def _meta(self) -> Text:
@@ -451,7 +453,9 @@ class FechaScreen(DialogoModal):
                 yield Button("\\[cancel]", id="fecha-cancelar", classes="chip secundario")
             yield Static("", id="fecha-error", classes="error-linea")
             yield Static(
-                "1-5 date · ^s save · ^x clear · esc cancel",
+                # 1-5 (quick-picks), ^s y ^x ya van en el label de su propio widget:
+                # lo único sin representación visible en la pantalla es esc.
+                "esc cancel",
                 id="fecha-hint",
                 classes="hint",
             )
@@ -567,15 +571,19 @@ class NuevaScreen(DialogoModal):
                 yield Button("\\[cancel]", id="nueva-cancelar", classes="chip secundario")
             yield Static("", id="nueva-error", classes="error-linea")
             yield Static(
-                # `^enter` (Ctrl+Enter) no es un atajo confiable: la mayoría de las
+                # 1-5 (quick-picks), ^r y ^s ya van en el label de su propio widget:
+                # lo único sin representación visible en la pantalla es esc.
+                #
+                # `^enter` (Ctrl+Enter) no se anuncia en ningún lado, ni acá ni en el
+                # botón de crear, porque no es un atajo confiable: la mayoría de las
                 # terminales (sin el protocolo de teclado de Kitty de punta a punta,
                 # p. ej. cualquier sesión con tmux/SSH de por medio) mandan el MISMO
                 # byte que Enter (\r) para ambos, así que Textual nunca ve "ctrl+enter"
                 # y el binding no dispara — verificado con XTermParser().feed("\r").
                 # `ctrl+s` sí llega distinguible (Textual desactiva IXON/IXOFF, así
-                # que ni el flow control de la tty se lo come) y sigue bindeado en
-                # BINDINGS más abajo: acá solo se corrige lo que el hint promete.
-                "1-5 date · ^r repeat · ^s create · esc cancel",
+                # que ni el flow control de la tty se lo come) y es el que el botón
+                # `[^s·create]` anuncia de verdad.
+                "esc cancel",
                 id="nueva-hint",
                 classes="hint",
             )
@@ -777,7 +785,9 @@ class ConfirmaScreen(DialogoModal):
             with Horizontal(classes="fila-botones"):
                 yield Button("\\[y·yes, close]", id="ok", classes="chip peligro")
                 yield Button("\\[n·cancel]", id="no", classes="chip secundario")
-            yield Static("y close · n/esc cancel", id="confirma-hint", classes="hint")
+            # y y n ya van en el label de su botón (`[y·yes, close]`, `[n·cancel]`):
+            # lo único sin representación visible en la pantalla es esc.
+            yield Static("esc cancel", id="confirma-hint", classes="hint")
 
     def al_montar(self) -> None:
         self.query_one("#no", Button).focus()
