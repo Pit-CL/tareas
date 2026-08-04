@@ -256,6 +256,47 @@ When nothing is left pending, it says so:
 
 ![Nothing pending](docs/empty.png)
 
+## Scripting: `tareas add`
+
+`tareas add` creates a task without opening the TUI — for a script, a cron job, or
+an agent that just finished a spec and wants to file it as a task. It reuses the
+same GraphQL calls as the app, so a task created this way is identical to one
+created from the new-task dialog.
+
+```bash
+tareas add "Renew the SSL certificate"
+tareas add "Fix the checkout bug" --repo vela/landing --due 2026-09-10
+```
+
+- `--repo owner/repo` (or just `repo`, which uses the `owner` from your config).
+  Without it, `tareas add` falls back to the same contextual detection as the
+  TUI: the repo of the directory you're running it from; if that can't be
+  resolved either, it fails and asks for `--repo`.
+- `--due` accepts `YYYY-MM-DD` or `DD-MM-YYYY`. Without it the task has no due date.
+- `--notes "…"` sets the issue body. For anything long or multiline — the usual
+  case when an agent is filing a full spec — pass `--notes -` and pipe it in
+  instead of fighting shell quoting:
+
+```bash
+tareas add "Add CSV export to the reports page" --repo iktus-erp --due 2026-08-20 --notes - <<'EOF'
+## Spec
+
+- Export button next to the date filter
+- Same columns as the on-screen table
+- UTF-8 with BOM (opens right in Excel)
+EOF
+```
+
+On success it prints the issue reference and exits `0`:
+
+```
+created iktus-erp#431 · due 2026-08-20 · https://github.com/owner/iktus-erp/issues/431
+```
+
+On failure it prints a message to stderr and exits `2` — never anything else, so
+the crash-restart loop the TUI relies on (see below) can't turn one failed
+`tareas add` into a duplicate issue by retrying it.
+
 ## Colors
 
 The app defines a theme with `ansi=True`, so its colors are your terminal's **own
