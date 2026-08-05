@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import UTC, datetime
 
 import gh_falso
 import pytest
@@ -622,3 +623,139 @@ async def test_un_pr_ilegible_no_se_lleva_puesto_al_bueno(monkeypatch):
     tarea = await _una(monkeypatch, _con_pr({"state": "OPEN"}, gh_falso.pr(45)))
 
     assert tarea.pr.numero == 45
+
+
+# ------------------------------------------------------------------ comentarios
+# La tarea de prueba es la misma `_tarea()` que usan los tests de cierre: repo
+# `pit/web`, issue 7 y node ID `I_7` (o vacío, para el camino de reserva).
+async def test_los_comentarios_no_viajan_en_la_lectura_de_la_lista(monkeypatch):
+    """La regla dura, la misma que la del chip del PR al revés: listar el Project trae
+    el CONTEO y nada más. Traer los cuerpos de todas las tareas en cada refresco sería
+    pagar kilobytes cada 5 minutos por una conversación que se lee de a una."""
+    assert "totalCount" in datos._Q_ITEMS
+    assert "body" not in datos._Q_ITEMS.split("comments")[1].split("}")[0]
+
+    falso = GhFalso({"ItemsDelProject": gh_falso.pagina([gh_falso.item(1, comentarios=4)])})
+    monkeypatch.setattr(datos, "gh", falso)
+    tareas = await Backend(CONFIG).listar()
+
+    assert tareas[0].comentarios == 4
+    assert falso.veces("ComentariosDelIssue") == 0
+
+
+async def test_los_comentarios_se_leen_por_node_id_del_issue(monkeypatch):
+    falso = GhFalso(
+        {
+            "ComentariosDelIssue": gh_falso.comentarios(
+                gh_falso.comentario("elena-lumen", "First one", "2026-08-01T10:00:00Z"),
+                gh_falso.comentario("pit", "**Reproduced** it.", "2026-08-04T09:30:00Z"),
+            )
+        }
+    )
+    monkeypatch.setattr(datos, "gh", falso)
+    leidos = await Backend(CONFIG).comentarios(_tarea())
+
+    assert [(c.autor, c.cuerpo) for c in leidos] == [
+        ("elena-lumen", "First one"),
+        ("pit", "**Reproduced** it."),
+    ]
+    assert falso.variables_de("ComentariosDelIssue") == {"id": "I_7"}
+    assert falso.veces("ComentariosDelIssue") == 1
+
+
+async def test_la_consulta_pide_los_ULTIMOS_comentarios():
+    """`first` traería el principio de un hilo largo, que es justo lo que no interesa:
+    lo último que dijo el cliente es lo que hay que leer."""
+    assert f"comments(last: {datos.COMENTARIOS_RECIENTES})" in datos._Q_COMENTARIOS
+
+
+async def test_la_fecha_del_comentario_llega_en_hora_local_y_sin_tz(monkeypatch):
+    """GitHub manda UTC con «Z»; restarle `datetime.now()` (naive) reventaría con
+    TypeError, así que la capa de datos lo deja comparable antes de devolverlo."""
+    falso = GhFalso(
+        {"ComentariosDelIssue": gh_falso.comentarios(gh_falso.comentario(creado="2026-08-04T09:00:00Z"))}
+    )
+    monkeypatch.setattr(datos, "gh", falso)
+    comentario = (await Backend(CONFIG).comentarios(_tarea()))[0]
+
+    assert comentario.creado is not None
+    assert comentario.creado.tzinfo is None
+    esperado = datetime(2026, 8, 4, 9, 0, tzinfo=UTC).astimezone().replace(tzinfo=None)
+    assert comentario.creado == esperado
+    assert datos.hace_cuanto(comentario.creado, datetime.now())  # no revienta
+
+
+async def test_una_cuenta_borrada_no_deja_el_comentario_sin_autor(monkeypatch):
+    falso = GhFalso(
+        {"ComentariosDelIssue": gh_falso.comentarios(gh_falso.comentario(autor=None))}
+    )
+    monkeypatch.setattr(datos, "gh", falso)
+
+    assert (await Backend(CONFIG).comentarios(_tarea()))[0].autor == "ghost"
+
+
+async def test_un_comentario_ilegible_no_se_lleva_puesto_al_bueno(monkeypatch):
+    """Misma regla que el resto de la capa: lo que no se entiende se descarta."""
+    falso = GhFalso(
+        {
+            "ComentariosDelIssue": gh_falso.comentarios(
+                gh_falso.comentario("pit", "el bueno"), {"body": None, "author": None}
+            )
+        }
+    )
+    monkeypatch.setattr(datos, "gh", falso)
+    leidos = await Backend(CONFIG).comentarios(_tarea())
+
+    assert [c.cuerpo for c in leidos] == ["el bueno", ""]
+
+
+async def test_sin_node_id_los_comentarios_caen_al_camino_de_gh_issue_view(monkeypatch):
+    """Una tarea venida de un caché anterior a que se guardara el node ID: mismo camino
+    de reserva que `cerrar`. `gh issue view` los devuelve TODOS, así que además hay que
+    quedarse con la cola."""
+    falso = GhFalso(
+        {
+            "issue view": json.dumps(
+                {
+                    "comments": [
+                        gh_falso.comentario("a", f"comentario {i}") for i in range(6)
+                    ]
+                }
+            )
+        }
+    )
+    monkeypatch.setattr(datos, "gh", falso)
+    leidos = await Backend(CONFIG).comentarios(_tarea(issue_id=""))
+
+    assert [c.cuerpo for c in leidos] == [
+        f"comentario {i}" for i in (3, 4, 5)
+    ], "solo los últimos, y en orden"
+    assert falso.veces("ComentariosDelIssue") == 0
+    assert falso.usados[0][:5] == ("issue", "view", "7", "--repo", "pit/web")
+
+
+async def test_un_fallo_de_gh_al_leer_comentarios_sale_como_ErrorGh(monkeypatch):
+    """Quien la consume decide qué mostrar: la UI pone una línea y sigue."""
+    monkeypatch.setattr(
+        datos, "gh", GhFalso({"ComentariosDelIssue": ErrorGh("HTTP 502")})
+    )
+
+    with pytest.raises(ErrorGh):
+        await Backend(CONFIG).comentarios(_tarea())
+
+
+async def test_la_demo_entrega_tantos_comentarios_como_dice_contar():
+    """La lista, el detalle y el panel no pueden contradecirse: el conteo de la demo
+    sale de la misma conversación de muestra que se lee."""
+    demo = datos.BackendDemo()
+    con_conversacion = [t for t in await demo.listar() if t.comentarios]
+
+    assert con_conversacion, "la demo tiene que traer tareas con comentarios"
+    for tarea in con_conversacion:
+        leidos = await demo.comentarios(tarea)
+        assert len(leidos) == tarea.comentarios
+        assert all(c.autor and c.cuerpo and c.creado is not None for c in leidos)
+
+    sin_conversacion = [t for t in await demo.listar() if not t.comentarios]
+    assert sin_conversacion
+    assert await demo.comentarios(sin_conversacion[0]) == []

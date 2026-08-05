@@ -24,6 +24,12 @@ the opposite:
   dialogs stop being cramped — they gain padding and a blank line between groups.
   Below that they fall back to the compact layout. Dialogs are always as tall as
   their content, never taller.
+- **A preview panel when there's room.** From 120 columns up, the right half stops
+  being dead space: a panel follows the cursor with the selected task's description,
+  PR activity and latest comments. Below that width the layout is untouched.
+- **Comments you can read.** The detail shows the last three comments of the issue —
+  author, how long ago, body in markdown — so the client's reply doesn't need a
+  browser either.
 - **Contextual repo mode.** Launch it inside a repo with a GitHub remote and the
   app starts filtered to that repo, with a toggle (`t`, or a click on
   "all"/"this repo") to switch to the full list and back.
@@ -113,8 +119,9 @@ just goes back to asking `gh` for everything.
 
 ## Usage
 
-The main view is just the list, sorted by due date. Everything else is a dialog
-that opens on top and closes with `esc`, a click outside, or its own button.
+The main view is the list, sorted by due date (plus a read-only preview panel when
+the pane is wide enough — see below). Everything else is a dialog that opens on top
+and closes with `esc`, a click outside, or its own button.
 
 The header title shows the **real name of your GitHub Project** (fetched through
 `gh`, not a fixed label) while you're looking at the full list; in repo mode it
@@ -126,7 +133,7 @@ shows that repo's `owner/name` instead.
 |---|---|
 | Click a row | Selects it |
 | Click the already-selected row, or double-click | Opens the detail |
-| Wheel | Scrolls the list and the detail body |
+| Wheel | Scrolls the list, the detail body and the preview panel |
 | Click `+ new` / `⟳` (header) | Creates a task / reloads |
 | Click a footer shortcut | Runs that action |
 | Click the `↻ repeat:` chip | Cycles the recurrence |
@@ -282,11 +289,45 @@ One glyph can't tell *merged* from *green* — the detail spells it out, because
 it fits: `PR #45 · open · CI passing · ready to merge`, `PR #45 · draft · CI running`,
 `PR #45 · closed unmerged`. *Ready to merge* only shows up when GitHub agrees on all
 three counts: open, not a draft, no failing checks and no conflicts. The same line
-counts the issue's comments (`3 comments`) when there are any — the conversation the
-TUI doesn't show but you want to know about.
+counts the issue's comments (`3 comments`) when there are any.
 
 All of it travels in the very same query that lists the Project, so the chip costs no
 extra round trip: refreshing takes as long as it always did.
+
+### Reading the conversation
+
+A count isn't an answer, so the detail also **shows the last three comments** under
+the description, each one with its author, how long ago it was written, and its body
+rendered as markdown — which is usually where the client's reply lives.
+
+They don't hold the dialog back: the detail opens instantly with what's already in
+memory and the comments drop in underneath when `gh` answers, behind a `loading
+comments…` line. If the call fails you get a quiet `couldn't load comments` and
+everything else keeps working. A task with no comments shows none of this — not even
+the loading line.
+
+Unlike the count, the bodies are **not** part of the query that lists the Project:
+they're paragraphs, not integers, and they're asked for one task at a time, only when
+you're actually looking at it. Once read they're remembered for the session, keyed by
+the comment count, so a reload that brings a longer conversation asks again on its own.
+
+### A wide pane gets a preview panel
+
+From **120 columns** on, the list opens a preview panel on the right with the detail of
+the selected task — title, meta, PR activity, description and comments — and it follows
+the cursor. Below that width nothing changes at all: the panel isn't just hidden, it
+never gets built.
+
+The split is fixed at 46 columns for the panel. The table needs 28 columns before the
+first letter of a title (due date, the `↻` mark, `repo#N` and padding), so at 120 the
+title column keeps 46 of them against the 52 it has in the 80-column reference pane —
+and whatever the row now truncates, the panel gives back in full, wrapped, with the
+body underneath.
+
+Comments arrive lazily there: after ~0.4 s of the cursor sitting still, so running down
+the list doesn't fire one call per row. The panel never takes focus and has no buttons —
+`enter` still opens the detail dialog, which stays the full view and the place where
+actions live.
 
 ### Setting a due date without typing
 

@@ -5,14 +5,16 @@ Tres reglas mandan sobre el diseño:
 * **Cabe en un pane chico.** 80x15 es el caso de referencia; nada usa alto fijo y los
   anchos se recalculan en cada `Resize`, truncando con puntos suspensivos.
 * **Respira cuando hay lugar.** Desde `UMBRAL_HOLGADO` filas de pantalla los modales
-  separan sus grupos con una línea en blanco y ganan padding; bajo eso vuelven al
-  layout compacto. El alto de los diálogos siempre lo pone su contenido.
+  separan sus grupos con una línea en blanco y ganan padding; desde `UMBRAL_PREVIEW`
+  columnas la lista abre un panel lateral con el detalle de la fila seleccionada. Bajo
+  esos umbrales todo vuelve al layout compacto, sin una fila ni una columna de más.
 * **Se opera con mouse.** Cada acción tiene un blanco clickeable: filas, botones de la
   cabecera, teclas del footer y botones dentro de los modales. El teclado es atajo.
 """
 
 from __future__ import annotations
 
+import asyncio
 import functools
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -41,6 +43,7 @@ from .datos import (
     REPETICIONES,
     SECUNDARIO,
     Backend,
+    Comentario,
     ErrorGh,
     ErrorParcial,
     Tarea,
@@ -50,6 +53,7 @@ from .datos import (
     componer_cuerpo,
     etiqueta_vencimiento,
     fecha_larga,
+    hace_cuanto,
     interpretar_fecha,
     mas_un_mes,
     ordenar,
@@ -72,6 +76,43 @@ VIDA_NACIENTES = 120.0
 # modal más alto (nueva tarea, con el picker desplegado) mide 21 filas holgado, así que
 # 22 es el primer alto donde entra entero con margen. Debajo, layout compacto.
 UMBRAL_HOLGADO = 22
+
+# ------------------------------------------------------------------------------------
+# Panel de preview: el reparto del ancho, medido y no estimado.
+#
+# La tabla gasta 28 columnas fijas antes de la primera letra de un título: 9 del
+# vencimiento, 1 de la marca ↻, 8 de padding (2 por cada una de las 4 columnas) y 10
+# del ancho mínimo de `repo#N`. Medido con la demo, el título recibe exactamente
+# `ancho_del_pane - 28`:
+#
+#     ===== ======== =========
+#     pane   título   panel
+#     ===== ======== =========
+#      80        52        —      (el pane de referencia)
+#     120        92        —
+#     120        46       46      (con el panel abierto)
+#     160        86       46
+#     ===== ======== =========
+#
+# ANCHO_PREVIEW es fijo y no elástico porque lo que se lee ahí es prosa: un párrafo
+# markdown por debajo de ~40 columnas cae en dos o tres palabras por línea, y por
+# encima de ~50 el ojo pierde el renglón. 46 deja 43 de texto (1 del borde que lo
+# separa de la tabla y 2 de padding), que es justo esa franja.
+#
+# UMBRAL_PREVIEW es el ancho desde el que ese reparto todavía deja una tabla legible:
+# a 120 el título conserva 46 columnas -contra las 52 del pane de referencia- y lo que
+# se recorta en la fila el panel lo devuelve entero, envuelto y con el cuerpo debajo.
+# Más abajo el panel costaría más de lo que muestra, así que directamente no aparece
+# (bajo el umbral el layout es idéntico al de siempre, píxel por píxel).
+UMBRAL_PREVIEW = 120
+ANCHO_PREVIEW = 46
+# Cursor quieto antes de pedirle los comentarios a `gh`. Bajar la lista con `j` puesto
+# genera una selección por tecla, y sin esta espera cada una era una llamada de red;
+# 0,4 s es más de lo que dura el autorrepeat entre teclas y menos de lo que se tarda en
+# decidir que una tarea interesa. El worker es además `exclusive`: si igual se encolan
+# dos, solo sobrevive la última.
+ESPERA_COMENTARIOS = 0.4
+
 ANCHO_ETIQUETA_REPEAT = max(len(r) for r in REPETICIONES)
 # Fecha que no se entiende: el mismo aviso en los dos campos que la aceptan, y de paso
 # vuelve a enseñar los formatos (el placeholder ya no está a la vista cuando hay texto).
@@ -139,6 +180,111 @@ THEME_TERMINAL = Theme(
 # ------------------------------------------------------------------------------------
 # Piezas reutilizables
 # ------------------------------------------------------------------------------------
+# Las tres funciones que siguen componen el TEXTO de una tarea y no su árbol de
+# widgets: son lo que comparten el modal de detalle y el panel de preview, que muestran
+# lo mismo en dos marcos distintos. La alternativa -copiar `_meta`/`_actividad` al
+# panel- garantizaba que un arreglo se hiciera en un solo lado y el otro quedara viejo.
+def meta_tarea(tarea: Tarea, hoy: date) -> Text:
+    """Cliente · vencimiento · repetición, con el vencimiento en su color semántico.
+
+    Misma jerarquía que la columna de la lista (vencida en rojo, hoy en acento, lejana
+    en color 7): mirar el detalle no debería perder el dato que más se mira. Lo que no
+    lleva estilo hereda el color que el CSS le ponga al widget que la muestre.
+    """
+    _, estilo = etiqueta_vencimiento(tarea.vence, hoy)
+    partes = [Text(tarea.cliente), Text(fecha_larga(tarea.vence, hoy), estilo)]
+    if tarea.repeat:
+        partes.append(Text(f"↻ repeats {tarea.repeat}"))
+    return Text(" · ").join(partes)
+
+
+def actividad_tarea(tarea: Tarea) -> Text | None:
+    """PR vinculado y comentarios; None si la tarea no tiene ni lo uno ni lo otro.
+
+    Es la versión en palabras del chip de la lista: acá sí hay lugar para separar
+    «merged» de «CI verde» y «closed» de «CI roja», que en un glifo se confundirían.
+    El PR se lleva el color del chip -verde, rojo o color 7- para que una CI rota se
+    vea al abrir el detalle sin tener que leer la frase.
+
+    Devolver None y no un Text vacío es lo que deja que quien la muestra no gaste una
+    fila: en un pane de 15, una línea en blanco es una línea menos de descripción.
+    """
+    partes: list[Text] = []
+    if tarea.pr is not None:
+        _, estilo = chip_pr(tarea.pr)
+        partes.append(Text(resumen_pr(tarea.pr), estilo))
+    if tarea.comentarios:
+        plural = "" if tarea.comentarios == 1 else "s"
+        partes.append(Text(f"{tarea.comentarios} comment{plural}", SECUNDARIO))
+    return Text(" · ").join(partes) if partes else None
+
+
+def cabecera_comentario(comentario: Comentario, ahora: datetime) -> Text:
+    """«autor · hace cuánto», en secundario: quién habló y si es de recién."""
+    partes = [comentario.autor]
+    if comentario.creado is not None:
+        partes.append(hace_cuanto(comentario.creado, ahora))
+    return Text(" · ".join(partes), SECUNDARIO)
+
+
+class BloqueComentario(Vertical):
+    """Un comentario: su cabecera y su cuerpo renderizado como markdown.
+
+    La regla de arriba (`border-top`) es la misma que separa la meta del cuerpo en el
+    detalle, así que la conversación se lee como una continuación del issue y no como
+    otra pantalla.
+    """
+
+    def __init__(self, comentario: Comentario, ahora: datetime) -> None:
+        super().__init__(classes="comentario")
+        self.comentario = comentario
+        self.ahora = ahora
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import Markdown  # diferido, ver `DetalleScreen.compose`
+
+        yield Static(cabecera_comentario(self.comentario, self.ahora), classes="com-cabecera")
+        yield Markdown(self.comentario.cuerpo or "_(empty comment)_")
+
+
+class Comentarios(Vertical):
+    """Cola de comentarios al pie de un cuerpo scrolleable.
+
+    La misma pieza en el modal de detalle y en el panel de preview: un comentario se
+    lee igual en los dos lados y hay un solo lugar donde arreglarlo.
+
+    Todo lo que remonta bloques pasa por `mostrar`, que borra los anteriores y monta
+    los nuevos en un solo `await`. Con dos caminos -uno que borra y otro que monta- un
+    cursor que se mueve rápido llegaba a intercalarlos y dejaba comentarios de la tarea
+    anterior debajo de los de la nueva.
+    """
+
+    CARGANDO = "loading comments…"
+    ESPERANDO = "…"  # el panel mientras corre el debounce: ni una palabra de ruido
+    FALLO = "couldn't load comments"
+
+    def compose(self) -> ComposeResult:
+        yield Static("", classes="com-estado")
+
+    def anunciar(self, texto: str) -> None:
+        """Deja una sola línea en secundario (cargando, esperando o el fallo).
+
+        No toca los bloques ya montados: quien cambia de tarea llama antes a
+        `mostrar([])`.
+        """
+        for estado in self.query(".com-estado"):
+            estado.update(Text(texto, SECUNDARIO))
+            estado.display = bool(texto)
+
+    async def mostrar(self, comentarios: list[Comentario]) -> None:
+        """Reemplaza lo que haya por estos comentarios (la lista vacía deja el pie limpio)."""
+        await self.query(BloqueComentario).remove()
+        self.anunciar("")
+        if comentarios:
+            ahora = datetime.now()
+            await self.mount_all([BloqueComentario(c, ahora) for c in comentarios])
+
+
 class TablaTareas(DataTable):
     """DataTable cuya fila bajo el cursor se lee entera, sin `dim`.
 
@@ -163,6 +309,17 @@ class TablaTareas(DataTable):
     El `lru_cache` no es optimización: DataTable llama a `cache_clear()` sobre este
     método al invalidar sus cachés, así que sin el decorador la llamada revienta.
     """
+
+    class Redimensionada(Message):
+        """La tabla cambió de tamaño: sus columnas se derivan del ancho que le tocó."""
+
+    def on_resize(self, event: events.Resize) -> None:
+        # El `Resize` de la PANTALLA no alcanza: cuando el panel de preview aparece o
+        # se va, el pane mide lo mismo y es la tabla la que cambia de ancho. Escuchar
+        # el suyo es lo único que garantiza que las columnas se recalculen con el
+        # reparto ya hecho y no con el de un frame antes (`DataTable` atiende el suyo
+        # en `_on_resize`, así que este handler público no le pisa nada).
+        self.post_message(self.Redimensionada())
 
     @functools.lru_cache(maxsize=32)  # noqa: B019 - misma estrategia que DataTable
     def _get_styles_to_render_cell(
@@ -325,6 +482,10 @@ class DetalleScreen(DialogoModal):
     Los atajos son los MISMOS que en la lista (`x` cierra, `d` fecha): acá no hay
     ningún Input que se coma las letras, así que el gesto no cambia según dónde
     estés parado.
+
+    Los comentarios NO se esperan para abrir: el modal aparece al instante con lo que
+    ya está en memoria y un worker los agrega al pie del cuerpo cuando llegan. Abrir
+    una tarea no puede costar una ida y vuelta a GitHub.
     """
 
     BINDINGS = [
@@ -334,9 +495,18 @@ class DetalleScreen(DialogoModal):
         Binding("d", "cambiar_fecha", "", show=False),
     ]
 
-    def __init__(self, tarea: Tarea) -> None:
+    def __init__(
+        self,
+        tarea: Tarea,
+        traer_comentarios: Callable[[Tarea], Awaitable[list[Comentario]]] | None = None,
+    ) -> None:
+        """`traer_comentarios` llega por corrutina y no por valor, igual que los repos de
+        `NuevaScreen`: la trae quien tiene el backend y el modal no se entera de nada.
+        Sin ella (tests que solo miran el texto) el detalle es exactamente el de antes.
+        """
         super().__init__()
         self.tarea = tarea
+        self._traer_comentarios = traer_comentarios
 
     def compose(self) -> ComposeResult:
         # `Markdown` se importa acá y no arriba porque arrastra markdown-it y pygments:
@@ -354,6 +524,10 @@ class DetalleScreen(DialogoModal):
                 yield Static(actividad, id="det-actividad")
             with VerticalScroll(id="det-cuerpo"):
                 yield Markdown(self.tarea.cuerpo or "_(no description)_")
+                # Sin conversación no se monta nada: una tarea sin comentarios no paga
+                # ni la línea de "loading" ni la regla que la separaría del cuerpo.
+                if self._va_a_traer_comentarios:
+                    yield Comentarios(id="det-comentarios")
             yield Static("", classes="respiro")
             with Horizontal(classes="fila-botones"):
                 yield Button("\\[x·close task]", id="det-cerrar", classes="chip peligro")
@@ -365,39 +539,47 @@ class DetalleScreen(DialogoModal):
                 "j/k scroll · esc back", id="det-hint", classes="hint"
             )
 
-    def _meta(self) -> Text:
-        """Cliente · vencimiento · repetición, con el vencimiento en su color semántico.
+    @property
+    def _va_a_traer_comentarios(self) -> bool:
+        """Hay conversación que leer Y alguien a quien pedírsela."""
+        return bool(self.tarea.comentarios) and self._traer_comentarios is not None
 
-        Misma jerarquía que la columna de la lista (vencida en rojo, hoy en acento,
-        lejana en color 7): abrir el detalle no debería perder el dato que más se mira.
-        Lo que no lleva estilo hereda el `$accent` que el CSS le pone a `#det-meta`.
-        """
-        hoy = date.today()
-        _, estilo = etiqueta_vencimiento(self.tarea.vence, hoy)
-        partes = [Text(self.tarea.cliente), Text(fecha_larga(self.tarea.vence, hoy), estilo)]
-        if self.tarea.repeat:
-            partes.append(Text(f"↻ repeats {self.tarea.repeat}"))
-        return Text(" · ").join(partes)
+    def _meta(self) -> Text:
+        """La meta de esta tarea (ver `meta_tarea`, compartida con el panel de preview)."""
+        return meta_tarea(self.tarea, date.today())
 
     def _actividad(self) -> Text | None:
-        """PR vinculado y comentarios; None si la tarea no tiene ni lo uno ni lo otro.
-
-        Es la versión en palabras del chip de la lista: acá sí hay lugar para separar
-        «merged» de «CI verde» y «closed» de «CI roja», que en un glifo se confundirían.
-        El PR se lleva el color del chip -verde, rojo o color 7- para que una CI rota se
-        vea al abrir el detalle sin tener que leer la frase.
-        """
-        partes: list[Text] = []
-        if self.tarea.pr is not None:
-            _, estilo = chip_pr(self.tarea.pr)
-            partes.append(Text(resumen_pr(self.tarea.pr), estilo))
-        if self.tarea.comentarios:
-            plural = "" if self.tarea.comentarios == 1 else "s"
-            partes.append(Text(f"{self.tarea.comentarios} comment{plural}", SECUNDARIO))
-        return Text(" · ").join(partes) if partes else None
+        """La actividad de esta tarea (ver `actividad_tarea`, compartida con el panel)."""
+        return actividad_tarea(self.tarea)
 
     def al_montar(self) -> None:
         self.query_one("#det-cuerpo").focus()
+        if self._va_a_traer_comentarios:
+            self.query_one("#det-comentarios", Comentarios).anunciar(Comentarios.CARGANDO)
+            self._cargar_comentarios()
+
+    @work
+    async def _cargar_comentarios(self) -> None:
+        """Trae los comentarios y los deja al pie del cuerpo, ya con el modal abierto.
+
+        El guard de la vuelta no es paranoia: cerrar el modal cancela el worker, pero
+        la cancelación llega en el siguiente punto de espera, así que la línea que
+        sigue a este `await` puede correr con el diálogo ya desmontado. Sin preguntar
+        por el widget -y no por `is_mounted`, igual que `ListaScreen._pintable`-,
+        pintar ahí revienta con NoMatches.
+        """
+        traer = self._traer_comentarios
+        if traer is None:  # `al_montar` ya lo comprueba; acá por si alguien más llama
+            return
+        try:
+            comentarios = await traer(self.tarea)
+        except Exception:  # noqa: BLE001 - un fallo de `gh` no puede tumbar el detalle
+            if self.query("#det-comentarios"):
+                self.query_one("#det-comentarios", Comentarios).anunciar(Comentarios.FALLO)
+            return
+        if not self.query("#det-comentarios"):
+            return
+        await self.query_one("#det-comentarios", Comentarios).mostrar(comentarios)
 
     def _respirar(self) -> None:
         super()._respirar()
@@ -827,6 +1009,68 @@ class ConfirmaScreen(DialogoModal):
 
 
 # ------------------------------------------------------------------------------------
+# Panel de preview
+# ------------------------------------------------------------------------------------
+class PanelPreview(Vertical):
+    """Detalle de la tarea bajo el cursor, a la derecha de la lista en un pane ancho.
+
+    Es SOLO LECTURA y no toma el foco nunca -ni por tab, de ahí el `can_focus=False`
+    del scroll-: la tabla manda, y `enter` sigue abriendo el modal, que es donde viven
+    los botones de acción. El panel solo evita tener que abrirlo para mirar.
+
+    Muestra lo mismo que el modal y con las mismas funciones (`meta_tarea`,
+    `actividad_tarea`, `Comentarios`); lo único propio es el reparto del ancho.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        # El ancho se fija ANTES de montar, no en `on_mount`: `Vertical` viene con
+        # `width: 1fr` de fábrica y con eso el primer layout repartía el pane mitad y
+        # mitad. La tabla se recalculaba con ese ancho de mentira y sus columnas
+        # quedaban a la mitad de lo que les tocaba. Vive en Python y no en el CSS
+        # porque el CSS de la App es un string de clase: así la medida y su porqué
+        # quedan juntos en ANCHO_PREVIEW.
+        self.styles.width = ANCHO_PREVIEW
+        #: (item_id, cuerpo) ya pintados. El markdown solo se rehace cuando cambian:
+        #: bajar la lista con `j` puesto reparsearía un documento por tecla.
+        self._pintado: tuple[str, str] = ("", "")
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import Markdown  # diferido, ver `DetalleScreen.compose`
+
+        yield Static("", id="prev-titulo")
+        yield Static("", id="prev-meta")
+        yield Static("", id="prev-actividad")
+        with VerticalScroll(id="prev-cuerpo", can_focus=False):
+            yield Markdown(id="prev-md")
+            yield Comentarios(id="prev-comentarios")
+
+    def mostrar(self, tarea: Tarea) -> None:
+        """Repinta el panel con `tarea`.
+
+        La meta y la actividad se rehacen siempre -son dos Static y cambian al fechar
+        o al llegar un refresco-; el cuerpo, solo cuando hay otro que renderizar.
+        """
+        self.query_one("#prev-titulo", Static).update(Text(tarea.titulo, style="bold"))
+        self.query_one("#prev-meta", Static).update(meta_tarea(tarea, date.today()))
+        actividad = actividad_tarea(tarea)
+        linea = self.query_one("#prev-actividad", Static)
+        linea.display = actividad is not None
+        linea.update(actividad if actividad is not None else Text(""))
+
+        pintado = (tarea.item_id, tarea.cuerpo)
+        if pintado == self._pintado:
+            return
+        self._pintado = pintado
+        from textual.widgets import Markdown
+
+        self.query_one("#prev-md", Markdown).update(tarea.cuerpo or "_(no description)_")
+        # Se vuelve arriba: quedarse al pie del cuerpo anterior mostraría la nueva
+        # tarea empezada por la mitad.
+        self.query_one("#prev-cuerpo", VerticalScroll).scroll_home(animate=False)
+
+
+# ------------------------------------------------------------------------------------
 # Pantalla principal
 # ------------------------------------------------------------------------------------
 class ListaScreen(Screen):
@@ -904,6 +1148,16 @@ class ListaScreen(Screen):
         # No se persiste: para cuando la app reinicia, GitHub ya la devuelve.
         self.nacientes: dict[str, float] = {}
         self.aviso_campo_dado = False
+        # Comentarios ya traídos, mientras dure la sesión. La clave lleva el CONTEO de
+        # comentarios además del item_id: cuando el refresco periódico trae una
+        # conversación más larga, la clave cambia sola y el próximo vistazo vuelve a
+        # preguntar, sin caducidad inventada ni invalidación a mano. No baja a disco a
+        # propósito -son cuerpos de texto que envejecen rápido y el caché de la lista ya
+        # cubre lo que hace falta para pintar al arrancar-.
+        self._comentarios: dict[tuple[str, int], list[Comentario]] = {}
+        #: Clave de los comentarios que el panel de preview tiene pedidos, para no
+        #: volver a pedirlos en cada repintado de la tabla. None con el panel escondido.
+        self._preview_comentado: tuple[str, int] | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="cabecera"):
@@ -923,8 +1177,14 @@ class ListaScreen(Screen):
         tabla = TablaTareas(id="tabla")
         tabla.cursor_type = "row"
         tabla.show_header = False
-        yield tabla
-        yield Static("", id="vacio")
+        # La fila se reparte entre la tabla y el panel de preview. El panel NO se monta
+        # acá: lo hace `_panel_preview` la primera vez que el pane da el ancho (ver
+        # UMBRAL_PREVIEW), así un pane angosto no paga ni el widget ni los 39 ms de
+        # markdown-it que arrastra su Markdown. Con el panel ausente la fila queda
+        # exactamente como antes: un solo hijo al 100%.
+        with Horizontal(id="cuerpo"):
+            yield tabla
+            yield Static("", id="vacio")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1057,6 +1317,18 @@ class ListaScreen(Screen):
         except Exception:  # noqa: BLE001 - sin repos el modal lo dice y sigue
             self.repos = []
 
+    async def obtener_comentarios(self, tarea: Tarea) -> list[Comentario]:
+        """Los últimos comentarios del issue, recordados por lo que dure la sesión.
+
+        La misma corrutina alimenta al panel de preview y al modal de detalle, así que
+        abrir el detalle de la tarea que el panel ya mostró no vuelve a llamar a `gh`
+        (ver `self._comentarios` para la clave y por qué no se persiste).
+        """
+        clave = (tarea.item_id, tarea.comentarios)
+        if clave not in self._comentarios:
+            self._comentarios[clave] = await self.backend.comentarios(tarea)
+        return self._comentarios[clave]
+
     async def obtener_repos(self) -> list[str]:
         """Repos del owner, esperando a la carga en curso si todavía no llegaron.
 
@@ -1138,6 +1410,7 @@ class ListaScreen(Screen):
         self._pintar_vacio()
         self._pintar_cabecera()
         if vacio:
+            self._pintar_preview()  # sin fila seleccionada no hay nada que previsualizar
             return
 
         # Responsive: los anchos se derivan del pane, nunca son fijos.
@@ -1174,6 +1447,7 @@ class ListaScreen(Screen):
                 key=tarea.item_id,
             )
         self._reubicar_cursor(tabla, recordado, fila_recordada, visibles)
+        self._pintar_preview()
 
     @staticmethod
     def _celda_cliente(tarea: Tarea, ancho: int) -> Text:
@@ -1241,6 +1515,119 @@ class ListaScreen(Screen):
                 destino = indice
                 break
         tabla.cursor_coordinate = Coordinate(max(0, min(destino, len(visibles) - 1)), 0)
+
+    # ------------------------------------------------------------------ preview
+    def _panel_preview(self) -> PanelPreview | None:
+        """El panel, montándolo la primera vez que hace falta; None si recién nació.
+
+        No se monta en `compose` porque su `Markdown` arrastra markdown-it y pygments
+        (39 ms del arranque, ver `DetalleScreen.compose`): en un pane angosto -el caso
+        de referencia- el panel no existe y no se paga nada. Recién montado todavía no
+        compuso sus hijos, así que devuelve None y quien llama vuelve tras el refresco.
+        """
+        paneles = self.query(PanelPreview)
+        if not paneles:
+            self.query_one("#cuerpo", Horizontal).mount(PanelPreview(id="preview"))
+            self.call_after_refresh(self._pintar_preview)
+            return None
+        panel = paneles.first(PanelPreview)
+        if not panel.query("#prev-titulo"):
+            # Montado pero todavía sin componer (Textual monta a los hijos en su propio
+            # ciclo): pintarlo ahora reventaría con NoMatches.
+            self.call_after_refresh(self._pintar_preview)
+            return None
+        return panel
+
+    def _pintar_preview(self) -> None:
+        """Deja el panel mostrando la tarea bajo el cursor, o lo esconde.
+
+        Se llama tras cada repintado de la tabla, en cada movimiento del cursor y en
+        cada resize: el panel es un espejo de la selección, no un estado propio. Con el
+        filtro puesto la selección es la del subconjunto filtrado, así que el panel
+        habla de lo que se está viendo y no de la lista entera.
+        """
+        if not self._pintable:
+            return
+        tarea = self.seleccionada
+        if tarea is None or self.size.width < UMBRAL_PREVIEW:
+            self._esconder_preview()
+            return
+        panel = self._panel_preview()
+        if panel is None:
+            return  # se acaba de montar: `call_after_refresh` vuelve a pasar por acá
+        aparecio = not panel.display
+        panel.display = True
+        panel.mostrar(tarea)
+        # Los comentarios solo se vuelven a pedir cuando cambia la tarea o le crecen
+        # (la clave lleva el conteo, ver `self._comentarios`). Sin este corte, cada
+        # repintado de la tabla -uno por tecla mientras se escribe el filtro- volvía a
+        # desmontar y montar los bloques que ya estaban a la vista.
+        clave = (tarea.item_id, tarea.comentarios)
+        if aparecio or clave != self._preview_comentado:
+            self._preview_comentado = clave
+            self._comentarios_al_preview(tarea)
+        if aparecio:
+            self._repartir_de_nuevo()
+
+    def _esconder_preview(self) -> None:
+        self._preview_comentado = None
+        for panel in self.query(PanelPreview):
+            if panel.display:
+                panel.display = False
+                self._repartir_de_nuevo()
+
+    def _repartir_de_nuevo(self) -> None:
+        """Recalcula las columnas de la tabla cuando el panel aparece o desaparece.
+
+        Tiene que ser DESPUÉS del refresco: los anchos salen de
+        `tabla.scrollable_content_region`, que hasta que Textual no rehace el layout
+        sigue midiendo el pane sin repartir. No hay bucle: la segunda vuelta encuentra
+        al panel ya en su sitio y no vuelve a pedir reparto.
+        """
+        self.call_after_refresh(self._pintar_tabla)
+
+    @work(exclusive=True, group="comentarios")
+    async def _comentarios_al_preview(self, tarea: Tarea) -> None:
+        """Los comentarios de la tarea seleccionada, al pie del cuerpo del panel.
+
+        `exclusive` más la espera de `ESPERA_COMENTARIOS` son el debounce: cada tecla
+        cancela el worker anterior -y con él su espera-, así que recorrer la lista de
+        punta a punta no dispara una llamada a `gh` por fila, solo la de donde el
+        cursor se queda. Lo ya traído se pinta sin esperar nada.
+        """
+        pie = self.query("#prev-comentarios")
+        if not pie:
+            return
+        comentarios = pie.first(Comentarios)
+        guardados = self._comentarios.get((tarea.item_id, tarea.comentarios))
+        if guardados is None:
+            # Se limpia ANTES de esperar: los comentarios de la tarea anterior bajo el
+            # cuerpo de la nueva se leerían como si fueran de esta.
+            await comentarios.mostrar([])
+            if not tarea.comentarios:
+                return
+            comentarios.anunciar(Comentarios.ESPERANDO)
+            await asyncio.sleep(ESPERA_COMENTARIOS)
+            try:
+                guardados = await self.obtener_comentarios(tarea)
+            except Exception:  # noqa: BLE001 - el panel lo dice en una línea y sigue
+                comentarios.anunciar(Comentarios.FALLO)
+                return
+        # El cursor pudo moverse (o la pantalla irse) mientras `gh` contestaba: sin
+        # este guard el panel mostraría la conversación de otra tarea.
+        actual = self.seleccionada if self._pintable else None
+        if actual is None or actual.item_id != tarea.item_id or not self.query("#prev-comentarios"):
+            return
+        await comentarios.mostrar(guardados)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        # El panel sigue al cursor, se mueva con teclado o con un clic.
+        self._pintar_preview()
+
+    def on_tabla_tareas_redimensionada(self, event: TablaTareas.Redimensionada) -> None:
+        event.stop()
+        if self.visibles:
+            self._pintar_tabla()
 
     def _pintar_vacio(self) -> None:
         # Todo lo de acá se LEE (es lo único en pantalla), así que va en color 7 y no
@@ -1354,13 +1741,21 @@ class ListaScreen(Screen):
         return f"{cuantas}/{len(self.del_repo)}" if self.filtro else str(cuantas)
 
     def _hace_cuanto(self) -> str:
+        """Antigüedad del dato de la lista, con la misma escala que los comentarios.
+
+        Antes contaba solo minutos y una sesión larga sin red terminaba anunciando
+        «180m ago»; `hace_cuanto` sube a horas y días donde corresponde.
+        """
         if self.ultimo_ok is None:
             return "—"
-        minutos = int((datetime.now() - self.ultimo_ok).total_seconds() // 60)
-        return "just now" if minutos < 1 else f"{minutos}m ago"
+        return hace_cuanto(self.ultimo_ok, datetime.now())
 
     def on_resize(self, event: events.Resize) -> None:
         self._pintar_cabecera()
+        # El panel aparece y desaparece en vivo al cambiar el ancho del pane; va antes
+        # que la tabla porque es lo que decide cuánto ancho le queda (`_repartir_de_nuevo`
+        # se encarga de que la tabla se recalcule con el reparto ya hecho).
+        self.call_after_refresh(self._pintar_preview)
         if self.visibles:
             self.call_after_refresh(self._pintar_tabla)
 
@@ -1517,7 +1912,9 @@ class ListaScreen(Screen):
         tarea = self.seleccionada
         if tarea is None:
             return
-        siguiente = await self._mostrar_modal(DetalleScreen(tarea))
+        siguiente = await self._mostrar_modal(
+            DetalleScreen(tarea, self.obtener_comentarios)
+        )
         if siguiente == "cerrar":
             await self._cerrar(tarea)
         elif siguiente == "fecha":
@@ -1711,12 +2108,46 @@ class TareasApp(App):
     .cab-btn { width: auto; height: 1; padding: 0 1; color: $accent; }
     .cab-btn:hover { background: $panel; text-style: bold; }
 
-    #tabla { height: 1fr; width: 100%; scrollbar-size-vertical: 1; }
+    /* La fila del medio: la tabla (o el mensaje de lista vacía) y, en un pane ancho,
+       el panel de preview a su derecha. Con el panel ausente -que es el caso bajo
+       UMBRAL_PREVIEW- el único hijo visible ocupa el 100% y el layout queda idéntico
+       al de antes de que existiera este contenedor. */
+    #cuerpo { height: 1fr; width: 100%; }
+    #tabla { height: 1fr; width: 1fr; scrollbar-size-vertical: 1; }
     #vacio {
-        display: none; height: 1fr; width: 100%;
+        display: none; height: 1fr; width: 1fr;
         content-align: center middle; text-align: center;
     }
     Footer { height: 1; }
+
+    /* El ancho lo pone `PanelPreview.on_mount` (ver ANCHO_PREVIEW). El borde izquierdo
+       es la única separación con la tabla: en ansi_white, el mismo tono neutro que la
+       regla del detalle y el marco de los modales, nunca el acento -que está reservado
+       a lo accionable, y el panel no lo es-. */
+    #preview { height: 1fr; border-left: solid ansi_white; padding: 0 1; }
+    #prev-titulo { height: auto; max-height: 3; text-style: bold; }
+    #prev-meta { height: auto; color: $accent; }
+    /* Igual que #det-actividad: el color lo trae cada segmento del Text. */
+    #prev-actividad { height: auto; }
+    #prev-cuerpo {
+        height: 1fr; width: 100%; scrollbar-size-vertical: 1;
+        border-top: solid ansi_white;
+    }
+    /* Markdown se pone `padding: 0 2` por defecto: en el modal eso indenta el cuerpo
+       bajo la meta y se lee como jerarquía, pero acá son 4 de las 43 columnas del
+       panel gastadas en sangría. A este ancho el texto vale más que el margen. */
+    #preview Markdown { padding: 0; }
+    /* Sin esto el contenedor de comentarios se lleva el 1fr que Vertical trae de
+       fábrica y empuja el cuerpo fuera de la vista aun estando vacío. */
+    Comentarios { height: auto; width: 100%; }
+    /* Cada comentario se separa del anterior (y del cuerpo del issue) con la MISMA
+       regla que parte la meta del cuerpo en el detalle: la conversación se lee como
+       continuación del issue, no como otra pantalla. */
+    .comentario { height: auto; width: 100%; border-top: solid ansi_white; }
+    .com-cabecera { height: auto; width: 100%; }
+    /* Nace escondido: solo aparece mientras hay algo que decir ("loading comments…",
+       "…" o el fallo), así una tarea sin conversación no gasta ni una fila. */
+    .com-estado { display: none; height: auto; width: 100%; }
 
     /* Modales: todo relativo al viewport, nada con medidas fijas. El alto lo pone el
        contenido (height: auto), así un detalle de una línea no abre un modal enorme. */
