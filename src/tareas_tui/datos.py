@@ -469,6 +469,126 @@ def proxima_fecha(base: date, repeat: str, hoy: date) -> date:
     return avanzar(base, repeat, veces)
 
 
+# ------------------------------------------------------------------ entrada de fechas (en)
+# Lo que se puede escribir en un campo de vencimiento además del formato canónico.
+# Todo en inglés, porque la UI lo está.
+_DIAS_SEMANA: tuple[str, ...] = (
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+)
+_MESES: tuple[str, ...] = (
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+)
+# `+10d`, `+2w`, `+3m`. Los espacios se sacan antes de mirar, así que "+ 10 d" también.
+_RE_RELATIVA = re.compile(r"^\+(\d{1,4})([dwm])$")
+
+#: Los tres formatos que los placeholders de la app enseñan, en una línea. Van juntos y
+#: en este orden a propósito: el canónico primero (es el que se guarda en GitHub) y
+#: después uno de cada familia, que es lo que hace adivinar el resto.
+EJEMPLOS_FECHA = "YYYY-MM-DD · fri · +10d"
+
+
+def _por_prefijo(token: str, nombres: tuple[str, ...]) -> int | None:
+    """Índice del ÚNICO nombre de `nombres` que empieza con `token`; None si hay duda.
+
+    Con tres letras alcanza para que ni los días (`mon`…`sun`) ni los meses
+    (`jan`…`dec`) se pisen entre sí, y de yapa entran las formas largas y las
+    intermedias que la gente escribe igual (`tues`, `thurs`, `sept`, `august`).
+    """
+    if len(token) < 3:
+        return None
+    coinciden = [i for i, nombre in enumerate(nombres) if nombre.startswith(token)]
+    return coinciden[0] if len(coinciden) == 1 else None
+
+
+def _dia_y_mes(texto: str, hoy: date) -> date | None:
+    """`aug 20` o `20 aug`; si ese día ya pasó este año, se entiende el del que viene.
+
+    El único año que se prueba después del actual es el siguiente: escribir un mes y
+    un día es hablar de los próximos doce meses, no de una fecha lejana (para eso está
+    el formato canónico, que lleva el año escrito).
+    """
+    partes = texto.replace(",", " ").split()
+    if len(partes) != 2:
+        return None
+    primera, segunda = partes
+    mes, dia = _por_prefijo(primera, _MESES), segunda
+    if mes is None:
+        mes, dia = _por_prefijo(segunda, _MESES), primera
+    if mes is None or not dia.isdigit():
+        return None
+    for ano in (hoy.year, hoy.year + 1):
+        try:
+            candidata = date(ano, mes + 1, int(dia))
+        except ValueError:
+            # Un día que no existe en ese mes (`feb 30`), o el 29 de febrero cuando el
+            # año que toca no es bisiesto: no hay nada que adivinar, se pide el formato
+            # canónico como con cualquier otra entrada que no se entiende.
+            return None
+        if candidata >= hoy:
+            return candidata
+    return None
+
+
+def interpretar_fecha(texto: str | None, hoy: date) -> date | None:
+    """Lo que el usuario escribió en un campo de vencimiento, resuelto a una fecha.
+
+    `hoy` va como parámetro y no se lee de `date.today()` acá adentro para que todo
+    esto sea probable sin depender del día en que corra la suite.
+
+    Acepta, sin importar la caja ni los espacios de más:
+
+    ===================== ==========================================================
+    `2026-08-20`           el formato canónico, el que viaja a GitHub
+    `today`                hoy
+    `tomorrow` · `tom`     mañana
+    `+10d` `+2w` `+3m`     días, semanas y meses calendario contados desde `hoy`
+    `fri` · `friday`       la PRÓXIMA vez que caiga ese día: parado en un viernes,
+                           `fri` es el viernes que viene (hoy + 7), nunca hoy — un
+                           vencimiento que se escribe es siempre uno que todavía no
+                           llegó
+    `aug 20` · `20 aug`    ese día; si ya pasó este año, el del año que viene
+    ===================== ==========================================================
+
+    Devuelve None ante cualquier cosa que no se entienda de UNA sola forma. Quien
+    llama decide qué hacer con eso (la TUI avisa en la línea del hint, el CLI sale con
+    código 2): fechar con una interpretación a medias sería peor que no fechar.
+
+    No reusa `parsear_fecha` para el formato canónico a propósito: esa es tolerante
+    porque lee el caché -un valor corrupto en disco no puede tumbar la app- y acá hace
+    falta lo contrario, que lo que está mal escrito falle.
+    """
+    limpio = " ".join((texto or "").split()).casefold()
+    if not limpio:
+        return None
+
+    try:
+        return date.fromisoformat(limpio)
+    except ValueError:
+        pass
+
+    if limpio == "today":
+        return hoy
+    if limpio in {"tomorrow", "tom"}:
+        return hoy + timedelta(days=1)
+
+    relativa = _RE_RELATIVA.match(limpio.replace(" ", ""))
+    if relativa:
+        cantidad, unidad = int(relativa.group(1)), relativa.group(2)
+        if unidad == "d":
+            return hoy + timedelta(days=cantidad)
+        if unidad == "w":
+            return hoy + timedelta(weeks=cantidad)
+        return mas_meses(hoy, cantidad)  # el recorte de fin de mes ya está resuelto ahí
+
+    dia_semana = _por_prefijo(limpio, _DIAS_SEMANA)
+    if dia_semana is not None:
+        salto = (dia_semana - hoy.weekday()) % 7
+        return hoy + timedelta(days=salto or 7)
+
+    return _dia_y_mes(limpio, hoy)
+
+
 # ------------------------------------------------------------------ format (en)
 def etiqueta_vencimiento(vence: date | None, hoy: date) -> tuple[str, str | Style]:
     """Devuelve (texto, estilo rich). Máximo ANCHO_VENCE caracteres.

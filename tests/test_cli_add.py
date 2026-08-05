@@ -10,6 +10,7 @@ TTY (headless: sin terminal, no puede haberla).
 from __future__ import annotations
 
 import io
+from datetime import date, timedelta
 
 import gh_falso
 import pytest
@@ -194,3 +195,57 @@ def test_main_rutea_add_sin_pedir_terminal(monkeypatch, capsys):
 
     assert entrada.main() == 0
     assert "interactive terminal" not in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------ fechas naturales
+@pytest.mark.parametrize(
+    ("escrito", "dias"), [("tomorrow", 1), ("tom", 1), ("today", 0), ("+10d", 10)]
+)
+def test_add_acepta_las_mismas_fechas_que_la_tui(monkeypatch, capsys, escrito, dias):
+    """Un agente que crea tareas no debería tener que calcular la fecha: `--due +10d`
+    resuelve lo mismo que escribirlo en el modal (`datos.interpretar_fecha`)."""
+    falso = GhFalso()
+    _instalar(monkeypatch, falso)
+    esperada = (date.today() + timedelta(days=dias)).isoformat()
+
+    codigo = entrada._cmd_add(["Something", "--repo", "pit/web", "--due", escrito])
+
+    assert codigo == 0
+    assert falso.variables_de("FecharItem")["valor"] == esperada
+    assert f"due {esperada}" in capsys.readouterr().out
+
+
+def test_add_acepta_un_dia_de_la_semana(monkeypatch, capsys):
+    falso = GhFalso()
+    _instalar(monkeypatch, falso)
+
+    codigo = entrada._cmd_add(["Something", "--repo", "pit/web", "--due", "fri"])
+
+    assert codigo == 0
+    guardada = date.fromisoformat(falso.variables_de("FecharItem")["valor"])
+    assert guardada.weekday() == 4  # viernes
+    assert 1 <= (guardada - date.today()).days <= 7  # el próximo, nunca hoy
+
+
+def test_add_sigue_aceptando_los_dos_formatos_numericos(monkeypatch, capsys):
+    falso = GhFalso()
+    _instalar(monkeypatch, falso)
+
+    assert entrada._cmd_add(["A", "--repo", "pit/web", "--due", "2026-09-01"]) == 0
+    assert falso.variables_de("FecharItem")["valor"] == "2026-09-01"
+    assert entrada._cmd_add(["B", "--repo", "pit/web", "--due", "01-09-2026"]) == 0
+    assert falso.variables_de("FecharItem")["valor"] == "2026-09-01"
+
+
+def test_add_fecha_en_ingles_que_no_se_entiende_sale_con_2_sin_tocar_github(monkeypatch, capsys):
+    falso = GhFalso()
+    _instalar(monkeypatch, falso)
+
+    with pytest.raises(SystemExit) as salida:
+        entrada._cmd_add(["Something", "--repo", "pit/web", "--due", "next friday"])
+
+    assert salida.value.code == 2
+    error = capsys.readouterr().err
+    assert "invalid date" in error
+    assert "+10d" in error  # el mensaje enseña lo que sí entra
+    assert falso.usados == []
