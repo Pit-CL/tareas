@@ -263,35 +263,34 @@ async def test_ningun_chip_se_sale_de_su_fila(size, tecla, contenedor):
 
 
 # ------------------------------------------------------------------ contraste del cursor
-async def test_la_fila_bajo_el_cursor_conserva_el_color_de_cada_celda():
-    """Con `cursor_foreground_priority="renderable"` cada celda que ya tiene un color
-    propio -la fecha vencida en rojo, el repo en su tono- lo conserva bajo el cursor;
-    con la prioridad "css" de antes, el cursor aplanaba TODA la fila a un solo color
-    (el suyo). El fondo de la selección sigue siendo el mismo para toda la fila -no se
-    pierde el "esta es la elegida"-, y ninguna celda sobrevive en `dim` (el bug que
-    motivó `TablaTareas`, ver su docstring)."""
+async def test_la_fila_bajo_el_cursor_se_lee_entera_sin_dim():
+    """El bug que motivó `TablaTareas`: una celda en `dim` se difuminaba sobre el fondo
+    ámbar del cursor hasta quedar ilegible. Bajo el cursor no debe sobrevivir ningún
+    `dim`, y todo el texto de la fila comparte el color del cursor.
+
+    Desde el cambio de contraste ya ninguna celda se pinta en `dim` -repo y vencimientos
+    pasaron al color 7-, así que `TablaTareas` quedó de guarda por si alguna vuelve."""
     app = TareasApp(BackendDemo())
     async with app.run_test(size=(110, 24)) as pilot:
         screen = await _listo(pilot)
         tabla = screen.query_one("#tabla", TablaTareas)
         assert tabla.has_focus
 
-        await pilot.press("j")  # fila 1: acme/web#12, vencida ("bold red")
+        await pilot.press("j")  # fila 1: acme/web#12, vencida, con marca ↻
         await pilot.pause()
         assert tabla.cursor_row == 1
 
-        cursor_style = tabla.get_component_rich_style("datatable--cursor")
+        color_cursor = tabla.get_component_rich_style("datatable--cursor").color
         bajo_cursor = [s for s in tabla.render_line(1) if s.text.strip()]
         assert bajo_cursor
         assert all(not s.style.dim for s in bajo_cursor)
-        # El fondo de la selección es compartido por toda la fila...
-        assert all(s.style.bgcolor == cursor_style.bgcolor for s in bajo_cursor)
-        # ...pero el color de las celdas con estilo propio no se aplana a uno solo.
-        assert len({s.style.color for s in bajo_cursor}) > 1
-        vencimiento = next(s for s in bajo_cursor if s.text.strip() == "3d ago")
-        assert vencimiento.style.color == Style.parse("red").color
-        repo = next(s for s in bajo_cursor if s.text.strip() == "web")
-        assert repo.style.color == Style.parse(color_repo("acme/web")).color
+        assert {s.style.color for s in bajo_cursor} == {color_cursor}
+
+        # control: fuera del cursor cada fila conserva SUS colores (la jerarquía), en vez
+        # de quedar aplanada al color del cursor.
+        otra_fila = [s for s in tabla.render_line(0) if s.text.strip()]
+        assert otra_fila
+        assert {s.style.color for s in otra_fila} != {color_cursor}
 
 
 # ------------------------------------------------------------------ respiración adaptativa
@@ -1176,6 +1175,8 @@ async def test_el_color_por_repo_es_estable_y_evita_rojo_y_amarillo():
     async with app.run_test(size=(110, 24)) as pilot:
         screen = await _listo(pilot)
         tabla = screen.query_one("#tabla", TablaTareas)
+        await pilot.press("j")  # el cursor pisa el color de su fila: se corre a la 1
+        await pilot.pause()
 
         # vela/landing aparece dos veces en la demo (filas 0 y 4): mismo repo, mismo
         # color en ambas.

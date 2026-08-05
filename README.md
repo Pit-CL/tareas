@@ -345,14 +345,11 @@ lands on the same one, never red or yellow (those stay reserved for overdue and 
 the accent/selection) — which makes tasks from the same repo easy to group at a
 glance across a long list.
 
-The row under the cursor keeps each cell's own color instead of flattening the whole
-row to one — overdue stays red, the repo keeps its tone — only the background changes
-to mark the selection. Textual's `cursor_foreground_priority` defaults to overriding
-the *color* of every cell to match the cursor's own; `"renderable"` leaves it alone.
-That still doesn't reach *attributes*: a cell marked `dim` used to keep fading against
-the cursor's background until it was unreadable. Nothing ships `dim` any more, but
-`TablaTareas` still cancels it on that row so the problem can't come back in through a
-new cell.
+The row under the cursor paints text in color 0 over color 3. Textual's
+`cursor_foreground_priority` only overrides the *color* of a cell, never its
+attributes, so a cell marked `dim` used to keep fading against the cursor's
+background until it was unreadable. Nothing ships `dim` any more, but `TablaTareas`
+still cancels it on that row so the problem can't come back in through a new cell.
 
 ## Running in a persistent pane
 
