@@ -327,10 +327,10 @@ semantic slots (red for overdue, yellow for due soon). That's why the screenshot
 above look different from each other — it's the same code over different palettes —
 and why there's nothing to configure to make it look right in light or dark.
 
-Secondary text that you actually *read* — distant and missing due dates, the repo
-column, the hints, the sync timestamp, the field placeholders, the `[cancel]`
-buttons — uses **color 7**, not `dim`. `dim` is rendered by blending the text into
-the background, which drops it to 2.7:1 on light and 4.0:1 on dark; color 7
+Secondary text that you actually *read* — distant and missing due dates, the issue
+number next to each repo, the hints, the sync timestamp, the field placeholders, the
+`[cancel]` buttons — uses **color 7**, not `dim`. `dim` is rendered by blending the
+text into the background, which drops it to 2.7:1 on light and 4.0:1 on dark; color 7
 measures 7.38:1 on light and 10.72:1 on dark while still sitting below normal text
 (10.24:1 / 12.30:1), so the hierarchy survives and the text stays legible. `dim` is
 kept only for the decorative `·` separators in the header.
@@ -339,11 +339,20 @@ The due date column is the one that earns the most from this, since it's the who
 point of the row. It reads as four steps: **overdue** (bold red) → **today** (bold
 amber) → **due soon** (amber) → **far off or undated** (color 7).
 
-The row under the cursor paints text in color 0 over color 3. Textual's
-`cursor_foreground_priority` only overrides the *color* of a cell, never its
-attributes, so a cell marked `dim` used to keep fading against the cursor's
-background until it was unreadable. Nothing ships `dim` any more, but `TablaTareas`
-still cancels it on that row so the problem can't come back in through a new cell.
+The repo name next to each issue number gets its own color too — cyan, magenta,
+blue or green, picked deterministically from the repo's name so the same repo always
+lands on the same one, never red or yellow (those stay reserved for overdue and for
+the accent/selection) — which makes tasks from the same repo easy to group at a
+glance across a long list.
+
+The row under the cursor keeps each cell's own color instead of flattening the whole
+row to one — overdue stays red, the repo keeps its tone — only the background changes
+to mark the selection. Textual's `cursor_foreground_priority` defaults to overriding
+the *color* of every cell to match the cursor's own; `"renderable"` leaves it alone.
+That still doesn't reach *attributes*: a cell marked `dim` used to keep fading against
+the cursor's background until it was unreadable. Nothing ships `dim` any more, but
+`TablaTareas` still cancels it on that row so the problem can't come back in through a
+new cell.
 
 ## Running in a persistent pane
 
