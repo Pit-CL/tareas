@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta
 import gh_falso
 import pytest
 from gh_falso import GhFalso
+from rich.style import Style
 from textual.coordinate import Coordinate
 from textual.widgets import Button, Input, OptionList
 
@@ -28,7 +29,7 @@ from tareas_tui.app import (
     TablaTareas,
     TareasApp,
 )
-from tareas_tui.datos import BackendDemo, ErrorGh, proxima_fecha, vacio_demo
+from tareas_tui.datos import BackendDemo, ErrorGh, color_repo, proxima_fecha, vacio_demo
 
 pytestmark = pytest.mark.asyncio
 
@@ -262,34 +263,35 @@ async def test_ningun_chip_se_sale_de_su_fila(size, tecla, contenedor):
 
 
 # ------------------------------------------------------------------ contraste del cursor
-async def test_la_fila_bajo_el_cursor_se_lee_entera_sin_dim():
-    """El bug que motivó `TablaTareas`: una celda en `dim` se difuminaba sobre el fondo
-    ámbar del cursor hasta quedar ilegible. Bajo el cursor no debe sobrevivir ningún
-    `dim`, y todo el texto de la fila comparte el color del cursor.
-
-    Desde el cambio de contraste ya ninguna celda se pinta en `dim` -repo y vencimientos
-    pasaron al color 7-, así que `TablaTareas` quedó de guarda por si alguna vuelve."""
+async def test_la_fila_bajo_el_cursor_conserva_el_color_de_cada_celda():
+    """Con `cursor_foreground_priority="renderable"` cada celda que ya tiene un color
+    propio -la fecha vencida en rojo, el repo en su tono- lo conserva bajo el cursor;
+    con la prioridad "css" de antes, el cursor aplanaba TODA la fila a un solo color
+    (el suyo). El fondo de la selección sigue siendo el mismo para toda la fila -no se
+    pierde el "esta es la elegida"-, y ninguna celda sobrevive en `dim` (el bug que
+    motivó `TablaTareas`, ver su docstring)."""
     app = TareasApp(BackendDemo())
     async with app.run_test(size=(110, 24)) as pilot:
         screen = await _listo(pilot)
         tabla = screen.query_one("#tabla", TablaTareas)
         assert tabla.has_focus
 
-        await pilot.press("j")  # fila 1: repetitiva, con marca ↻
+        await pilot.press("j")  # fila 1: acme/web#12, vencida ("bold red")
         await pilot.pause()
         assert tabla.cursor_row == 1
 
-        color_cursor = tabla.get_component_rich_style("datatable--cursor").color
+        cursor_style = tabla.get_component_rich_style("datatable--cursor")
         bajo_cursor = [s for s in tabla.render_line(1) if s.text.strip()]
         assert bajo_cursor
         assert all(not s.style.dim for s in bajo_cursor)
-        assert {s.style.color for s in bajo_cursor} == {color_cursor}
-
-        # control: fuera del cursor cada fila conserva SUS colores (la jerarquía), en vez
-        # de quedar aplanada al color del cursor.
-        otra_fila = [s for s in tabla.render_line(0) if s.text.strip()]
-        assert otra_fila
-        assert {s.style.color for s in otra_fila} != {color_cursor}
+        # El fondo de la selección es compartido por toda la fila...
+        assert all(s.style.bgcolor == cursor_style.bgcolor for s in bajo_cursor)
+        # ...pero el color de las celdas con estilo propio no se aplana a uno solo.
+        assert len({s.style.color for s in bajo_cursor}) > 1
+        vencimiento = next(s for s in bajo_cursor if s.text.strip() == "3d ago")
+        assert vencimiento.style.color == Style.parse("red").color
+        repo = next(s for s in bajo_cursor if s.text.strip() == "web")
+        assert repo.style.color == Style.parse(color_repo("acme/web")).color
 
 
 # ------------------------------------------------------------------ respiración adaptativa
@@ -1145,8 +1147,9 @@ def _es_color_7(segmento) -> bool:
 
 async def test_el_texto_secundario_de_la_lista_no_va_en_dim():
     """`dim` en esta paleta cae a 3,98:1 sobre fondo claro. El texto secundario que se
-    LEE (repo, timestamp del refresco) va en el color 7, que mide 7,38:1 en claro y
-    10,72:1 en oscuro sin perder jerarquía contra el texto normal."""
+    LEE (el número de issue en la columna repo#issue, el timestamp del refresco) va en
+    el color 7, que mide 7,38:1 en claro y 10,72:1 en oscuro sin perder jerarquía
+    contra el texto normal."""
     app = TareasApp(BackendDemo())
     async with app.run_test(size=(110, 24)) as pilot:
         screen = await _listo(pilot)
@@ -1154,13 +1157,35 @@ async def test_el_texto_secundario_de_la_lista_no_va_en_dim():
         await pilot.press("j")  # el cursor pisa el color de su fila: se corre a la 1
         await pilot.pause()
 
-        repo = [s for s in tabla.render_line(0) if "landing#31" in s.text]
-        assert repo
-        assert all(_es_color_7(s) for s in repo)
+        numero = [s for s in tabla.render_line(0) if s.text.strip() == "#31"]
+        assert numero
+        assert all(_es_color_7(s) for s in numero)
 
         segmentos = _pintado(screen.query_one("#cab-refrescar"))
         assert segmentos
         assert all(_es_color_7(s) for s in segmentos)
+
+
+async def test_el_color_por_repo_es_estable_y_evita_rojo_y_amarillo():
+    """El nombre del repo en la columna repo#issue usa un tono determinista (ver
+    `color_repo`, probado suelto en `test_repeticion.py`): el mismo repo siempre pinta
+    el mismo color, nunca rojo -reservado a vencido/peligro- ni amarillo -acento/
+    selección-, y nunca `dim`. El `#N` de al lado sigue en color 7 (ver el test de
+    arriba), sin heredar el color del repo."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        tabla = screen.query_one("#tabla", TablaTareas)
+
+        # vela/landing aparece dos veces en la demo (filas 0 y 4): mismo repo, mismo
+        # color en ambas.
+        landing_31 = [s for s in tabla.render_line(0) if s.text.strip() == "landing"]
+        landing_3 = [s for s in tabla.render_line(4) if s.text.strip() == "landing"]
+        assert landing_31 and landing_3
+        assert not any(s.style.dim for s in [*landing_31, *landing_3])
+        colores = {s.style.color for s in [*landing_31, *landing_3]}
+        assert colores == {Style.parse(color_repo("vela/landing")).color}
+        assert color_repo("vela/landing") not in {"red", "yellow"}
 
 
 async def test_los_hints_del_estado_vacio_no_van_en_dim():

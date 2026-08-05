@@ -14,6 +14,7 @@ import pytest
 from tareas_tui.datos import (
     MARCA_REPEAT,
     avanzar,
+    color_repo,
     componer_cuerpo,
     mas_meses,
     mas_un_mes,
@@ -182,3 +183,16 @@ def test_la_proxima_siempre_queda_en_el_futuro(repeat, atraso):
 def test_proxima_rechaza_intervalos_desconocidos():
     with pytest.raises(ValueError):
         proxima_fecha(date(2026, 6, 10), "none", date(2026, 6, 10))
+
+
+# ------------------------------------------------------------------ color por repo
+def test_color_repo_es_determinista_entre_llamadas():
+    """No puede usar el `hash()` builtin: Python lo aleatoriza por proceso
+    (PYTHONHASHSEED), así que el mismo repo cambiaría de color en cada arranque de la
+    app. Acá se comprueba llamando dos veces sueltas -no una sola vez cacheada- y que
+    el resultado caiga en la paleta permitida, sin rojo ni amarillo (reservados a
+    vencido/peligro y a acento/selección)."""
+    assert color_repo("acme/web") == color_repo("acme/web")
+    assert color_repo("vela/landing") == color_repo("vela/landing")
+    assert color_repo("acme/web") in {"cyan", "magenta", "blue", "green"}
+    assert color_repo("acme/web") != color_repo("vela/landing")

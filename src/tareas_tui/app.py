@@ -45,6 +45,7 @@ from .datos import (
     Tarea,
     acortar,
     chip_pr,
+    color_repo,
     componer_cuerpo,
     etiqueta_vencimiento,
     fecha_larga,
@@ -134,15 +135,21 @@ THEME_TERMINAL = Theme(
 # Piezas reutilizables
 # ------------------------------------------------------------------------------------
 class TablaTareas(DataTable):
-    """DataTable cuya fila bajo el cursor se lee entera, sin `dim`.
+    """DataTable cuya fila bajo el cursor conserva el color semántico de cada celda.
 
-    `cursor_foreground_priority="css"` (el default) solo pisa el **color** del
-    renderable: Textual lo aplica como `Style.from_color(color=...)` en el `post_style`
-    de la celda, y ahí no hay forma de tocar los atributos. Una celda marcada `dim`
-    -la columna de repo, o un vencimiento lejano- se seguía difuminando contra el fondo
-    del cursor (el filtro ANSI resuelve `dim` mezclando texto y fondo), y sobre el
-    ámbar quedaba ilegible. Sumamos `dim=False` a ese mismo `post_style`, que es el
-    único punto del pipeline donde se puede cancelar un atributo del renderable.
+    Se construye con `cursor_foreground_priority="renderable"`: por default Textual
+    pisa el **color** del renderable con el del cursor (`Style.from_color(...)` en el
+    `post_style` de la celda), así que toda la fila -vencida en rojo, hoy en acento,
+    lejana en color 7- se aplanaba al mismo color al seleccionarla. Con "renderable"
+    ese `post_style` no toca el color y cada celda mantiene el suyo sobre la barra de
+    selección; el fondo lo sigue poniendo el cursor (`cursor_background_priority`
+    default, no se toca), así que la fila sigue siendo obviamente la seleccionada.
+
+    Eso no alcanza para los *atributos*: una celda marcada `dim` -la columna de repo,
+    o un vencimiento lejano- se seguía difuminando contra el fondo del cursor (el
+    filtro ANSI resuelve `dim` mezclando texto y fondo), y sobre el ámbar quedaba
+    ilegible. Sumamos `dim=False` a ese mismo `post_style`, que es el único punto del
+    pipeline donde se puede cancelar un atributo del renderable.
 
     El `lru_cache` no es optimización: DataTable llama a `cache_clear()` sobre este
     método al invalidar sus cachés, así que sin el decorador la llamada revienta.
@@ -437,8 +444,8 @@ class FechaScreen(DialogoModal):
         self.actual = actual
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="dlg-fecha", classes="dlg"):
-            yield Static(f"due date · {acortar(self.titulo, 120)}", classes="dlg-titulo")
+        with Vertical(id="dlg-fecha", classes="dlg") as dlg:
+            dlg.border_title = f"due date · {acortar(self.titulo, 120)}"
             yield Static("", classes="respiro")
             yield AtajosFecha(classes="fila-chips")
             yield Static("", classes="respiro")
@@ -541,8 +548,8 @@ class NuevaScreen(DialogoModal):
         self.repeticion: str = "none"
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="dlg-nueva", classes="dlg"):
-            yield Static("new task", classes="dlg-titulo")
+        with Vertical(id="dlg-nueva", classes="dlg") as dlg:
+            dlg.border_title = "new task"
             if self.repo_prefijado is not None:
                 yield BotonCabecera(
                     f"\\[^p·repo: {self.repo_prefijado}]", "cambiar-repo",
@@ -869,7 +876,7 @@ class ListaScreen(Screen):
             yield BotonCabecera("", "toggle_repo", id="cab-toggle", classes="cab-btn")
             yield BotonCabecera("+ new", "nueva", id="cab-nueva", classes="cab-btn")
             yield BotonCabecera("⟳", "refrescar", id="cab-refrescar", classes="cab-btn")
-        tabla = TablaTareas(id="tabla")
+        tabla = TablaTareas(id="tabla", cursor_foreground_priority="renderable")
         tabla.cursor_type = "row"
         tabla.show_header = False
         yield tabla
@@ -1099,12 +1106,28 @@ class ListaScreen(Screen):
                 # En acento y no en dim: una columna de un carácter ya es discreta, y
                 # el dim de esta paleta se queda en 3,98:1 sobre el fondo claro.
                 Text("↻" if tarea.repeat else "", style="yellow"),
-                # Color 7 y no dim: el repo se LEE (ver SECUNDARIO).
-                Text(acortar(tarea.cliente, ancho_cliente), style=SECUNDARIO),
+                self._celda_cliente(tarea, ancho_cliente),
                 self._celda_titulo(tarea, ancho_titulo),
                 key=tarea.item_id,
             )
         self._reubicar_cursor(tabla, recordado, fila_recordada, visibles)
+
+    @staticmethod
+    def _celda_cliente(tarea: Tarea, ancho: int) -> Text:
+        """repo#N con el nombre del repo en su tono estable y el número en color 7.
+
+        Solo el nombre lleva color -distingue de un vistazo a qué repo pertenece la
+        fila-; el `#N` sigue en SECUNDARIO, igual que antes (ver `color_repo`). Sin
+        bold: ya hay tres colores con significado en la fila (vencimiento, ↻, PR) y
+        uno más en negrita competiría con ellos.
+        """
+        corto = tarea.repo.split("/", 1)[-1]
+        sufijo = f"#{tarea.numero}"
+        if len(corto) + len(sufijo) > ancho:
+            # No cabe entero: se trunca como un bloque (mismo comportamiento que
+            # antes de colorear por repo) en vez de partir un color a la fuerza.
+            return Text(acortar(tarea.cliente, ancho), style=SECUNDARIO)
+        return Text.assemble((corto, color_repo(tarea.repo)), (sufijo, SECUNDARIO))
 
     @staticmethod
     def _celda_titulo(tarea: Tarea, ancho: int) -> Text:
@@ -1207,7 +1230,12 @@ class ListaScreen(Screen):
             estado = [
                 (f"{cuantas} pending", "yellow"),
                 (" · ", "dim"),
-                (f"{vencidas} overdue", "bold red"),
+                # Token invertido: "reverse" pone el rojo de fondo y el texto en el
+                # color por defecto de la terminal, así el contraste queda garantizado
+                # por construcción en cualquier paleta (mismo truco que `.chip:hover`).
+                # Los espacios son parte del token, no relleno: sin ellos el fondo
+                # rojo pegaría el número y la palabra al resto de la cabecera.
+                (f" {vencidas} overdue ", "bold red reverse"),
             ]
         else:
             estado = [(f"{cuantas} pending", "yellow")]
@@ -1541,8 +1569,14 @@ class TareasApp(App):
     /* Modales: todo relativo al viewport, nada con medidas fijas. El alto lo pone el
        contenido (height: auto), así un detalle de una línea no abre un modal enorme. */
     DialogoModal { align: center middle; }
+    /* El borde va en ansi_white (color 7, el mismo tono que .hint y .secundario) y no
+       en $accent: con el acento reservado a [create] y a los quick-picks, el ojo va
+       directo a lo clickeable en vez de perderse en el marco. El título del borde SÍ
+       lleva acento -es la única etiqueta de "qué modal es este"-, así el amarillo no
+       desaparece del todo, solo se concentra donde importa. */
     .dlg {
-        background: $surface; border: round $accent; padding: 0 1;
+        background: $surface; border: round ansi_white; padding: 0 1;
+        border-title-color: $accent; border-title-style: bold;
         width: 90%; max-width: 100; height: auto; max-height: 100%;
     }
     /* Respiración adaptativa: la clase "holgado" la pone el modal cuando la pantalla

@@ -34,6 +34,7 @@ import contextlib
 import json
 import os
 import re
+import zlib
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 
@@ -58,6 +59,23 @@ ANCHO_REPEAT = 1  # la marca ↻ de las tareas repetitivas
 # "ansi_white" se ignora; en un Static (Content) "ansi_white" es el color 7 y "white"
 # es un #ffffff fijo, que rompería la herencia de la paleta en un terminal claro.
 SECUNDARIO = Style(color=ColorRich.from_ansi(7))
+
+# Tonos para el nombre de repo en la columna repo#issue de la lista. Ni rojo (reservado
+# a vencido/peligro) ni amarillo (acento/selección): así el color de repo no compite con
+# los dos que sí significan algo.
+_COLORES_REPO: tuple[str, ...] = ("cyan", "magenta", "blue", "green")
+
+
+def color_repo(repo: str) -> str:
+    """Tono ANSI estable para `repo` ("owner/nombre"), siempre el mismo entre arranques.
+
+    `hash()` builtin no sirve: Python lo aleatoriza por proceso (PYTHONHASHSEED), así
+    que el mismo repo cambiaría de color en cada arranque de la app. `zlib.crc32` es
+    determinista entre procesos y versiones de Python.
+    """
+    indice = zlib.crc32(repo.encode()) % len(_COLORES_REPO)
+    return _COLORES_REPO[indice]
+
 
 # Techo de espera de cualquier llamada a `gh`. Mismo valor que el `subprocess.run` de
 # config.py: con la red muerta `gh` no vuelve nunca, y sin techo la app se quedaba en
