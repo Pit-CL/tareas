@@ -967,6 +967,37 @@ async def test_la_fila_avisa_mientras_se_cierra_la_tarea():
         await _esperar(pilot, lambda: all(t.item_id != tarea.item_id for t in screen.tareas))
 
 
+@pytest.mark.parametrize(
+    "accion, pantalla",
+    [
+        ("action_ver", DetalleScreen),
+        ("action_fecha", FechaScreen),
+        ("action_cerrar", ConfirmaScreen),
+        ("action_nueva", NuevaScreen),
+    ],
+)
+async def test_dos_disparos_seguidos_no_apilan_dos_modales(accion, pantalla):
+    """Un doble clic (o dos teclas casi simultáneas) agendaba dos workers ANTES de que
+    el primero llegara a montar su modal: `screen_stack` terminaba con DOS pantallas
+    idénticas apiladas (ver `_mostrar_modal`)."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+
+        getattr(screen, accion)()
+        getattr(screen, accion)()
+        await pilot.pause()
+        await pilot.pause()
+
+        apiladas = [s for s in app.screen_stack if isinstance(s, pantalla)]
+        assert len(apiladas) == 1
+
+        # La que sobrevivió sigue funcional: esc la cierra y vuelve a la lista.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.screen is screen
+
+
 # ------------------------------------------------------------------ efectos parciales
 async def test_el_alta_a_medias_no_se_reporta_como_no_creada():
     """El issue ya existe en GitHub: decir "couldn't create the task" empuja a
