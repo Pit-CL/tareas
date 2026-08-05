@@ -90,6 +90,12 @@ LIMITE_ITEMS = 1000
 # Intervalos de repetición, en el orden en que los cicla el chip del modal.
 REPETICIONES: tuple[str, ...] = ("none", "daily", "weekly", "biweekly", "monthly")
 
+# Cuántos comentarios se leen de un issue. Tres son los últimos que importan -lo que el
+# cliente respondió recién- y caben bajo el cuerpo sin empujar nada fuera de un pane
+# chico; traer la conversación entera obligaría a paginar para leer lo mismo. Va también
+# dentro de la consulta (`last: N`), así que pedir más es cambiar solo este número.
+COMENTARIOS_RECIENTES = 3
+
 # Cuánto se recuerda -en disco- que una tarea se cerró desde acá. El workflow de
 # Projects que pone Status=Done corre segundos después de `gh issue close`, así que
 # un día es techo de sobra; sirve para que un item_id no quede escondido para
@@ -286,6 +292,25 @@ query IdDeRepo($owner: String!, $nombre: String!) {
 }
 """
 
+# Los comentarios NO viajan en la consulta que lista el Project: ahí solo va su conteo,
+# que es un entero por tarea. Traer los cuerpos de todas las tareas en cada refresco
+# sería pagar kilobytes cada 5 minutos por una conversación que se lee de a una.
+#
+# `last` y no `first`: la respuesta del cliente que interesa es la ÚLTIMA, y GitHub
+# devuelve los comentarios en orden cronológico, así que pedir los primeros traería el
+# principio de un hilo largo. El número se interpola en vez de ir como variable porque
+# `gh_graphql` manda todo con `-f` (String) y `last` es un Int: como variable, GitHub
+# rechaza la consulta entera.
+_Q_COMENTARIOS = """
+query ComentariosDelIssue($id: ID!) {
+  node(id: $id) {
+    ... on Issue {
+      comments(last: %d) { nodes { author { login } createdAt body } }
+    }
+  }
+}
+""" % COMENTARIOS_RECIENTES
+
 
 async def gh_graphql(consulta: str, **variables: str) -> dict:
     """Una llamada a la API GraphQL; devuelve el `data` de la respuesta.
@@ -393,6 +418,36 @@ class Tarea:
         """Etiqueta corta para la lista: sin el owner, que siempre es el mismo."""
         corto = self.repo.split("/", 1)[-1]
         return f"{corto}#{self.numero}"
+
+
+@dataclass(frozen=True)
+class Comentario:
+    """Un comentario del issue, lo mínimo para leerlo sin abrir el navegador."""
+
+    autor: str
+    cuerpo: str  # markdown tal cual lo escribió quien comentó
+    #: Cuándo se escribió, en hora local y sin tzinfo (ver `_momento_de`). None si
+    #: GitHub mandó algo que no se entiende: el comentario se muestra igual, sin fecha.
+    creado: datetime | None = None
+
+
+def _comentario_de_nodo(nodo: object) -> Comentario | None:
+    """Un nodo de `comments`; None ante cualquier cosa que no tenga la forma esperada.
+
+    Sirve para las DOS formas en que `gh` devuelve un comentario -la del GraphQL y la
+    de `gh issue view --json comments`-, porque las dos traen las mismas tres claves.
+    """
+    if not isinstance(nodo, dict):
+        return None
+    autor = nodo.get("author")
+    login = str((autor or {}).get("login") or "") if isinstance(autor, dict) else ""
+    return Comentario(
+        # GitHub manda `author: null` cuando la cuenta ya no existe, y "ghost" es como
+        # ella misma llama a ese autor en su propia interfaz.
+        autor=login or "ghost",
+        cuerpo=str(nodo.get("body") or "").strip(),
+        creado=_momento_de(nodo.get("createdAt")),
+    )
 
 
 def parsear_fecha(valor: str | None) -> date | None:
@@ -612,6 +667,27 @@ def etiqueta_vencimiento(vence: date | None, hoy: date) -> tuple[str, str | Styl
     return f"in {dias}d"[:ANCHO_VENCE], SECUNDARIO
 
 
+def hace_cuanto(momento: datetime, ahora: datetime) -> str:
+    """Antigüedad en dos palabras: «just now», «5m ago», «3h ago», «12d ago».
+
+    La usan el `⟳` de la cabecera (cuán viejo es el dato de la lista) y la cabecera de
+    cada comentario, que son la misma pregunta: hace cuánto pasó esto. Sube de unidad
+    en cada techo porque «97m ago» obliga a dividir mentalmente para entender que fue
+    hace más de una hora.
+
+    Un momento en el futuro -relojes desincronizados entre GitHub y la máquina- se lee
+    como «just now» en vez de como un número negativo.
+    """
+    segundos = max(0, int((ahora - momento).total_seconds()))
+    if segundos < 60:
+        return "just now"
+    minutos = segundos // 60
+    if minutos < 60:
+        return f"{minutos}m ago"
+    horas = minutos // 60
+    return f"{horas}h ago" if horas < 24 else f"{horas // 24}d ago"
+
+
 def fecha_larga(vence: date | None, hoy: date) -> str:
     if vence is None:
         return "no due date"
@@ -772,10 +848,18 @@ def _tarea_de_dict(crudo: object) -> Tarea | None:
 
 
 def _momento_de(crudo: object) -> datetime | None:
+    """Un timestamp ISO como datetime LOCAL y sin tzinfo; None si no se entiende.
+
+    Sin tzinfo a propósito: todo lo que se compara contra esto (`datetime.now()`,
+    `hace_cuanto`) es naive, y restar un aware de un naive revienta con TypeError. El
+    caché escribe naive y pasa derecho; el `createdAt` de GitHub viene en UTC con «Z»,
+    así que se convierte a la hora local de la máquina antes de soltarle el tz.
+    """
     try:
-        return datetime.fromisoformat(str(crudo))
+        momento = datetime.fromisoformat(str(crudo))
     except (TypeError, ValueError):
         return None
+    return momento.astimezone().replace(tzinfo=None) if momento.tzinfo else momento
 
 
 def _cwd() -> str:
@@ -994,6 +1078,33 @@ class Backend:
         )
         return ordenadas
 
+    async def comentarios(self, tarea: Tarea) -> list[Comentario]:
+        """Los últimos `COMENTARIOS_RECIENTES` comentarios del issue, del más viejo al
+        más nuevo.
+
+        Se pide de a UNA tarea y solo cuando alguien la mira: es lo contrario del resto
+        de la capa, que trae todo el Project de una. La razón es el volumen -el cuerpo
+        de un comentario son párrafos, no un entero- y que la conversación se lee de a
+        una tarea por vez.
+
+        Levanta `ErrorGh` como cualquier otra llamada; quien la consume decide qué
+        mostrar (la UI pone una línea discreta y sigue).
+        """
+        if tarea.issue_id:
+            datos = await gh_graphql(_Q_COMENTARIOS, id=tarea.issue_id)
+            nodos = ((datos.get("node") or {}).get("comments") or {}).get("nodes") or []
+        else:
+            # Tarea venida de un caché anterior a que se guardara el node ID: mismo
+            # camino de reserva que `cerrar`. `gh issue view` los devuelve TODOS, así
+            # que acá sí hay que quedarse con la cola.
+            crudo = await gh(
+                "issue", "view", str(tarea.numero), "--repo", tarea.repo,
+                "--json", "comments",
+            )
+            todos = json.loads(crudo or "{}").get("comments") or []
+            nodos = todos[-COMENTARIOS_RECIENTES:]
+        return [c for c in map(_comentario_de_nodo, nodos) if c is not None]
+
     async def repos(self) -> list[str]:
         """Repos del owner para el picker; de paso guarda sus node IDs.
 
@@ -1203,7 +1314,43 @@ _DEMO_PR: dict[int, PrVinculado] = {
     3: PrVinculado(numero=87, estado="open", ci="success", mergeable=True),
     21: PrVinculado(numero=9, estado="draft", ci="pending", mergeable=False),
 }
-_DEMO_COMENTARIOS: dict[int, int] = {48: 3, 12: 1}
+# Conversación de muestra, por número de issue: (autor, hace cuánto, cuerpo). El
+# conteo de comentarios de la demo sale de acá y no de una constante aparte, para que
+# la lista, el detalle y el panel de preview no puedan contradecirse. Los cuerpos
+# llevan markdown de verdad (negrita, viñetas) porque es lo que hay que ver renderizado
+# en las capturas del README.
+_DEMO_COMENTARIOS: dict[int, tuple[tuple[str, timedelta, str], ...]] = {
+    48: (
+        (
+            "elena-lumen",
+            timedelta(days=1, hours=2),
+            (
+                "We tested the new flow on staging and the **discount code** "
+                "disappears when you step back to the cart."
+            ),
+        ),
+        (
+            "pit",
+            timedelta(hours=5),
+            (
+                "Reproduced. The coupon lives in the session and not in the cart, "
+                "so going back rebuilds it empty."
+            ),
+        ),
+        (
+            "elena-lumen",
+            timedelta(minutes=40),
+            "Great. Can it ship before Friday? The campaign goes out on Monday.",
+        ),
+    ),
+    12: (
+        (
+            "marco-acme",
+            timedelta(days=3),
+            "Approved, go ahead with the renewal:\n\n- same plan\n- annual billing",
+        ),
+    ),
+}
 
 
 class BackendDemo(Backend):
@@ -1226,7 +1373,7 @@ class BackendDemo(Backend):
                     vence=None if dias is None else hoy + timedelta(days=dias),
                     repeat=repeat,
                     pr=_DEMO_PR.get(numero),
-                    comentarios=_DEMO_COMENTARIOS.get(numero, 0),
+                    comentarios=len(_DEMO_COMENTARIOS.get(numero, ())),
                 )
                 for numero, repo, titulo, dias, repeat in _DEMO
             ]
@@ -1250,6 +1397,18 @@ class BackendDemo(Backend):
 
     async def listar(self) -> list[Tarea]:
         return list(self._tareas)
+
+    async def comentarios(self, tarea: Tarea) -> list[Comentario]:
+        """Los de muestra, sin espera: la demo y la suite tienen que ser instantáneas.
+
+        Las fechas se calculan acá y no en `__init__` para que «5h ago» siga diciendo
+        5 horas por larga que sea la sesión de la que salen las capturas.
+        """
+        ahora = datetime.now()
+        return [
+            Comentario(autor=autor, cuerpo=cuerpo, creado=ahora - antiguedad)
+            for autor, antiguedad, cuerpo in _DEMO_COMENTARIOS.get(tarea.numero, ())
+        ]
 
     async def repos(self) -> list[str]:
         return ["acme/web", "korta/api", "lumen/shop", "mesa/intranet", "vela/landing"]

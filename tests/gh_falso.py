@@ -15,6 +15,7 @@ import json
 #: Operaciones GraphQL que la app puede pedir (los nombres viven en `datos.py`).
 OPERACIONES = (
     "ItemsDelProject",
+    "ComentariosDelIssue",
     "CrearIssue",
     "AgregarItem",
     "CerrarIssue",
@@ -103,6 +104,28 @@ def item(
     }
 
 
+def comentario(
+    autor: str | None = "elena-lumen",
+    cuerpo: str = "Looks good to me.",
+    creado: str = "2026-08-04T09:00:00Z",
+) -> dict:
+    """Un nodo de `comments`, con la forma de la API real.
+
+    `autor=None` es la cuenta borrada: GitHub manda `author: null`, no un login vacío.
+    `createdAt` viene siempre en UTC y con «Z», que es lo que hay que saber convertir.
+    """
+    return {
+        "author": {"login": autor} if autor else None,
+        "createdAt": creado,
+        "body": cuerpo,
+    }
+
+
+def comentarios(*nodos: dict) -> str:
+    """Respuesta de `ComentariosDelIssue`, en el orden en que GitHub los devuelve."""
+    return json.dumps({"data": {"node": {"comments": {"nodes": list(nodos)}}}})
+
+
 def pagina(nodos: list[dict], *, cursor: str | None = None) -> str:
     """Respuesta de `ItemsDelProject`; con `cursor` declara que hay página siguiente."""
     return json.dumps(
@@ -146,6 +169,8 @@ def id_repo(identificador: str = "R_test") -> str:
 #: Camino feliz: cualquier test que no declare una operación la recibe funcionando.
 POR_DEFECTO: dict[str, object] = {
     "ItemsDelProject": pagina([]),
+    "ComentariosDelIssue": comentarios(),
+    "issue view": '{"comments": []}',
     "CrearIssue": issue_creado(7),
     "AgregarItem": item_agregado("PVTI_test"),
     "CerrarIssue": '{"data":{}}',

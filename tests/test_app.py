@@ -21,11 +21,16 @@ from textual.widgets import Button, Input, OptionList
 
 from tareas_tui import datos
 from tareas_tui.app import (
+    ANCHO_PREVIEW,
+    ESPERA_COMENTARIOS,
+    UMBRAL_PREVIEW,
+    BloqueComentario,
     ConfirmaScreen,
     DetalleScreen,
     FechaScreen,
     ListaScreen,
     NuevaScreen,
+    PanelPreview,
     TablaTareas,
     TareasApp,
 )
@@ -2512,3 +2517,416 @@ async def test_el_footer_no_promete_atajos_que_no_disparan_mientras_se_escribe()
         await pilot.pause()
         assert _footer(screen)["enter"] == "view"
         assert _footer(screen)["escape"] == "clear"
+
+
+# ------------------------------------------------------------------ comentarios legibles
+class BackendComentariosColgados(BackendDemo):
+    """Los comentarios no llegan hasta que el test suelta el evento.
+
+    Es la ventana en la que el modal ya está abierto y `gh` todavía no contestó: lo
+    que hay que poder mirar es que el detalle se lea igual mientras tanto.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.suelta = asyncio.Event()
+
+    async def comentarios(self, tarea):
+        await self.suelta.wait()
+        return await super().comentarios(tarea)
+
+
+class BackendSinComentarios(BackendDemo):
+    """El issue existe pero `gh` no puede leer su conversación."""
+
+    async def comentarios(self, tarea):
+        raise ErrorGh("HTTP 502")
+
+
+class BackendCuentaComentarios(BackendDemo):
+    """Anota a qué issues se les pidieron los comentarios, y cuántas veces."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.pedidos: list[int] = []
+
+    async def comentarios(self, tarea):
+        self.pedidos.append(tarea.numero)
+        return await super().comentarios(tarea)
+
+
+def _cabeceras(nodo) -> list[str]:
+    """«autor · hace cuánto» de cada comentario montado bajo `nodo`."""
+    return [
+        str(bloque.query_one(".com-cabecera").content)
+        for bloque in nodo.query(BloqueComentario)
+    ]
+
+
+def _estado_comentarios(nodo) -> str:
+    """La línea de estado visible («loading comments…», «…», el fallo) o ""."""
+    visibles = [e for e in nodo.query(".com-estado") if e.display]
+    return str(visibles[0].content) if visibles else ""
+
+
+async def test_el_detalle_se_abre_sin_esperar_a_los_comentarios():
+    """La promesa de la app es no ir al navegador; abrir una tarea tampoco puede
+    costar una ida y vuelta a GitHub."""
+    backend = BackendComentariosColgados()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        modal = await _abrir_detalle(pilot, screen, 48)  # la demo le da 3 comentarios
+
+        assert isinstance(modal, DetalleScreen)
+        assert str(modal.query_one("#det-titulo").content).startswith("Change the checkout")
+        assert _estado_comentarios(modal) == "loading comments…"
+        assert not modal.query(BloqueComentario)
+
+        backend.suelta.set()
+        await _esperar(pilot, lambda: modal.query(BloqueComentario))
+        await pilot.pause(0.1)
+
+        assert _estado_comentarios(modal) == "", "la línea de carga se va con los comentarios"
+        assert _cabeceras(modal) == ["elena-lumen · 1d ago", "pit · 5h ago", "elena-lumen · 40m ago"]
+
+
+async def test_el_cuerpo_del_comentario_se_lee_como_markdown():
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        modal = await _abrir_detalle(pilot, screen, 12)  # un comentario, con viñetas
+        await _esperar(pilot, lambda: modal.query(BloqueComentario))
+
+        from textual.widgets import Markdown
+
+        bloque = modal.query_one(BloqueComentario)
+        assert bloque.query(Markdown), "el cuerpo va en el widget Markdown, no en un Static"
+        # Las viñetas del markdown se convierten en widgets propios: el texto crudo no.
+        pintado = " ".join(str(hijo.content) for hijo in bloque.query(".com-cabecera"))
+        assert "marco-acme" in pintado
+
+
+async def test_una_tarea_sin_comentarios_no_gasta_ni_la_linea_de_carga():
+    """Mismo criterio que la línea de actividad: en un pane de 15 filas, una línea
+    en blanco es una línea menos de descripción."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(80, 15)) as pilot:
+        screen = await _listo(pilot)
+        modal = await _abrir_detalle(pilot, screen, 31)  # sin PR ni comentarios
+        await pilot.pause(0.2)
+
+        assert not modal.query("#det-comentarios")
+        assert not modal.query(BloqueComentario)
+
+
+async def test_si_gh_no_puede_leer_los_comentarios_el_detalle_lo_dice_y_sigue():
+    """Una línea discreta, nunca un crash ni un modal a medias."""
+    app = TareasApp(BackendSinComentarios())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        modal = await _abrir_detalle(pilot, screen, 48)
+        await _esperar(pilot, lambda: _estado_comentarios(modal) == "couldn't load comments")
+
+        assert _estado_comentarios(modal) == "couldn't load comments"
+        assert not modal.query(BloqueComentario)
+        # El resto del detalle sigue en pie y sus atajos también.
+        assert modal.query_one("#det-cuerpo")
+        await pilot.press("escape")
+        await pilot.pause()
+        assert isinstance(pilot.app.screen, ListaScreen)
+
+
+async def test_cerrar_el_detalle_antes_de_que_contesten_no_revienta():
+    """Cancelar el worker no lo detiene en seco: la línea que sigue al `await` puede
+    correr con el diálogo ya desmontado, y ahí pintar reventaba con NoMatches."""
+    backend = BackendComentariosColgados()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        await _abrir_detalle(pilot, screen, 48)
+        await pilot.press("escape")  # antes de que lleguen
+        await pilot.pause()
+        backend.suelta.set()  # la respuesta llega con el diálogo ya desmontado
+        await pilot.pause(0.3)
+
+        assert isinstance(pilot.app.screen, ListaScreen)
+        assert not _avisos(pilot.app), "un error del worker habría salido como notificación"
+
+
+async def test_los_comentarios_no_se_vuelven_a_pedir_para_la_misma_tarea():
+    """La sesión los recuerda por (tarea, conteo): abrir dos veces el mismo detalle no
+    gasta dos llamadas, y si el refresco trae más comentarios la clave cambia sola."""
+    backend = BackendCuentaComentarios()
+    app = TareasApp(backend)
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        for _ in range(2):
+            modal = await _abrir_detalle(pilot, screen, 48)
+            await _esperar(pilot, lambda vista=modal: vista.query(BloqueComentario))
+            await pilot.press("escape")
+            await pilot.pause()
+
+        assert backend.pedidos == [48]
+
+
+@pytest.mark.parametrize(
+    ("segundos", "esperado"),
+    [(0, "just now"), (59, "just now"), (60, "1m ago"), (3599, "59m ago"),
+     (3600, "1h ago"), (86399, "23h ago"), (86400, "1d ago"), (86400 * 12, "12d ago"),
+     (-30, "just now")],
+)
+async def test_la_antiguedad_sube_de_unidad_en_cada_techo(segundos, esperado):
+    """«97m ago» obliga a dividir para entender que fue hace más de una hora; y un
+    momento en el futuro (relojes desincronizados) no puede salir en negativo."""
+    ahora = datetime(2026, 8, 5, 12, 0, 0)
+    assert datos.hace_cuanto(ahora - timedelta(seconds=segundos), ahora) == esperado
+
+
+# ------------------------------------------------------------------ panel de preview
+def _panel(screen) -> PanelPreview | None:
+    paneles = screen.query(PanelPreview)
+    return paneles.first(PanelPreview) if paneles else None
+
+
+def _preview_visible(screen) -> bool:
+    panel = _panel(screen)
+    return panel is not None and panel.display
+
+
+async def _con_panel(pilot):
+    """Espera a que el panel esté montado, visible y con la tarea del cursor pintada."""
+    screen = await _listo(pilot)
+    await _esperar(pilot, lambda: _preview_visible(screen))
+    await pilot.pause(0.1)
+    return screen
+
+
+def _titulo_preview(screen) -> str:
+    return screen.query_one("#prev-titulo").content.plain
+
+
+@pytest.mark.parametrize(
+    ("ancho", "visible"), [(80, False), (UMBRAL_PREVIEW - 1, False), (UMBRAL_PREVIEW, True)]
+)
+async def test_el_panel_solo_aparece_desde_el_umbral(ancho, visible):
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(ancho, 24)) as pilot:
+        screen = await _listo(pilot)
+        await pilot.pause(0.2)
+
+        assert _preview_visible(screen) is visible
+
+
+async def test_bajo_el_umbral_la_tabla_se_queda_con_el_pane_entero():
+    """El caso de referencia no paga nada por una función que no se muestra: ni el
+    ancho, ni el widget, ni el markdown-it que arrastra su Markdown."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(80, 15)) as pilot:
+        screen = await _listo(pilot)
+        await pilot.pause(0.2)
+        tabla = screen.query_one("#tabla", TablaTareas)
+
+        assert _panel(screen) is None, "bajo el umbral el panel ni se monta"
+        assert tabla.region.width == 80
+        assert tabla.columns[list(tabla.columns)[3]].width == 52
+
+
+async def test_el_panel_le_deja_a_la_tabla_lo_que_no_usa():
+    """El reparto es fijo: el panel se lleva ANCHO_PREVIEW y la tabla recalcula sus
+    columnas con lo que queda, no con el pane de antes de repartir."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(140, 24)) as pilot:
+        screen = await _con_panel(pilot)
+        tabla = screen.query_one("#tabla", TablaTareas)
+
+        assert _panel(screen).region.width == ANCHO_PREVIEW
+        assert tabla.region.width == 140 - ANCHO_PREVIEW
+        # 9 del vencimiento + 1 de ↻ + 10 de repo#N + 8 de padding = 28 fijas
+        assert tabla.columns[list(tabla.columns)[3]].width == 140 - ANCHO_PREVIEW - 28
+
+
+async def test_el_panel_muestra_la_tarea_seleccionada_entera():
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen = await _con_panel(pilot)
+        tabla = screen.query_one("#tabla", TablaTareas)
+        tabla.cursor_coordinate = Coordinate(_fila_de(screen, 48), 0)
+        await pilot.pause(0.1)
+        tarea = screen.seleccionada
+
+        assert _titulo_preview(screen) == tarea.titulo
+        meta = screen.query_one("#prev-meta").content.plain
+        assert tarea.cliente in meta and "due today" in meta
+        actividad = screen.query_one("#prev-actividad")
+        assert actividad.display
+        assert "PR #112 · open · CI failing" in str(actividad.content)
+
+
+async def test_el_panel_sigue_al_cursor():
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen = await _con_panel(pilot)
+        tabla = screen.query_one("#tabla", TablaTareas)
+        vistos = []
+        for fila in range(len(screen.visibles)):
+            tabla.cursor_coordinate = Coordinate(fila, 0)
+            await pilot.pause(0.1)
+            vistos.append(_titulo_preview(screen))
+
+        assert vistos == [t.titulo for t in screen.visibles]
+
+
+async def test_el_panel_aparece_y_desaparece_en_vivo_al_cambiar_el_ancho():
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(80, 24)) as pilot:
+        screen = await _listo(pilot)
+        await pilot.pause(0.2)
+        assert not _preview_visible(screen)
+
+        await pilot.resize_terminal(140, 24)
+        await pilot.pause(0.4)
+        assert _preview_visible(screen)
+        assert screen.query_one("#tabla", TablaTareas).region.width == 140 - ANCHO_PREVIEW
+
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause(0.4)
+        assert not _preview_visible(screen)
+        assert screen.query_one("#tabla", TablaTareas).region.width == 80
+
+
+async def test_el_foco_nunca_va_al_panel():
+    """Es solo lectura: la tabla manda, y un tab que se llevara el foco al panel
+    dejaría j/k sin efecto."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen = await _con_panel(pilot)
+        panel = _panel(screen)
+
+        assert not [w for w in panel.query("*") if w.focusable]
+        for _ in range(4):
+            await pilot.press("tab")
+            await pilot.pause()
+            assert screen.query_one("#tabla", TablaTareas).has_focus
+
+
+async def test_enter_sigue_abriendo_el_modal_con_el_panel_a_la_vista():
+    """El panel evita abrir el detalle para MIRAR; el modal sigue siendo la vista
+    completa y donde viven los botones de acción."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(140, 30)) as pilot:
+        await _con_panel(pilot)  # el panel ya está a la vista cuando llega el enter
+        await pilot.press("enter")
+        await _esperar(pilot, lambda: isinstance(pilot.app.screen, DetalleScreen))
+
+        assert isinstance(pilot.app.screen, DetalleScreen)
+        assert pilot.app.screen.query("#det-cerrar")
+
+
+async def test_el_panel_convive_con_el_filtro(monkeypatch):
+    """Con el filtro puesto la selección es la del subconjunto: el panel tiene que
+    hablar de lo que se está viendo, no de la lista entera."""
+    monkeypatch.setattr("tareas_tui.app.ESPERA_COMENTARIOS", 0.0)
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen = await _con_panel(pilot)
+        await _filtrar(pilot, "checkout")
+        await pilot.pause(0.2)
+
+        assert _titulos(screen) == ["Change the checkout payment flow"]
+        assert _titulo_preview(screen) == "Change the checkout payment flow"
+        await _esperar(pilot, lambda: len(screen.query(BloqueComentario)) == 3)
+        assert len(screen.query(BloqueComentario)) == 3
+
+
+async def test_sin_tareas_a_la_vista_el_panel_se_esconde():
+    app = TareasApp(vacio_demo())
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen = await _listo(pilot)
+        await pilot.pause(0.3)
+
+        assert not _preview_visible(screen)
+        assert screen.query_one("#vacio").display
+
+
+async def test_el_panel_trae_los_comentarios_de_la_seleccionada(monkeypatch):
+    monkeypatch.setattr("tareas_tui.app.ESPERA_COMENTARIOS", 0.0)
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen = await _con_panel(pilot)
+        tabla = screen.query_one("#tabla", TablaTareas)
+
+        tabla.cursor_coordinate = Coordinate(_fila_de(screen, 48), 0)
+        await _esperar(pilot, lambda: len(screen.query(BloqueComentario)) == 3)
+        assert _cabeceras(screen)[0].startswith("elena-lumen")
+
+        # Otra tarea, otra conversación: no puede quedar ni un bloque de la anterior.
+        tabla.cursor_coordinate = Coordinate(_fila_de(screen, 12), 0)
+        await _esperar(pilot, lambda: len(screen.query(BloqueComentario)) == 1)
+        assert _cabeceras(screen)[0].startswith("marco-acme")
+
+        # Y una sin conversación deja el pie limpio, sin línea de estado.
+        tabla.cursor_coordinate = Coordinate(_fila_de(screen, 31), 0)
+        await _esperar(pilot, lambda: not screen.query(BloqueComentario))
+        assert _estado_comentarios(screen.query_one("#prev-comentarios")) == ""
+
+
+async def test_recorrer_la_lista_rapido_no_pide_una_conversacion_por_fila():
+    """El debounce con el worker `exclusive`: bajar la lista con `j` puesto genera una
+    selección por tecla, y sin esto cada una era una llamada a `gh`."""
+    backend = BackendCuentaComentarios()
+    app = TareasApp(backend)
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen = await _con_panel(pilot)
+        for _ in range(len(screen.visibles) - 1):
+            await pilot.press("j")  # sin pausas: el cursor nunca se queda quieto
+        await pilot.pause(ESPERA_COMENTARIOS * 3)
+
+        assert len(backend.pedidos) <= 1, backend.pedidos
+
+        # Quedándose quieto sobre una con conversación, sí la pide (una sola vez).
+        screen.query_one("#tabla", TablaTareas).cursor_coordinate = Coordinate(
+            _fila_de(screen, 48), 0
+        )
+        await _esperar(pilot, lambda: 48 in backend.pedidos)
+        await pilot.pause(0.2)
+        assert backend.pedidos.count(48) == 1
+
+
+async def test_si_gh_falla_el_panel_lo_dice_en_una_linea(monkeypatch):
+    monkeypatch.setattr("tareas_tui.app.ESPERA_COMENTARIOS", 0.0)
+    app = TareasApp(BackendSinComentarios())
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen = await _con_panel(pilot)
+        screen.query_one("#tabla", TablaTareas).cursor_coordinate = Coordinate(
+            _fila_de(screen, 48), 0
+        )
+        pie = screen.query_one("#prev-comentarios")
+        await _esperar(pilot, lambda: _estado_comentarios(pie) == "couldn't load comments")
+
+        assert _estado_comentarios(pie) == "couldn't load comments"
+        assert _titulo_preview(screen) == "Change the checkout payment flow", (
+            "lo local se sigue viendo aunque la red falle"
+        )
+
+
+async def test_el_refresco_periodico_no_borra_lo_que_el_panel_muestra(monkeypatch):
+    """El panel convive con el refresco de fondo: repintar la tabla no puede dejarlo
+    en blanco ni remontar los comentarios que ya estaban a la vista."""
+    monkeypatch.setattr("tareas_tui.app.ESPERA_COMENTARIOS", 0.0)
+    backend = BackendCuentaComentarios()
+    app = TareasApp(backend)
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen = await _con_panel(pilot)
+        screen.query_one("#tabla", TablaTareas).cursor_coordinate = Coordinate(
+            _fila_de(screen, 48), 0
+        )
+        await _esperar(pilot, lambda: len(screen.query(BloqueComentario)) == 3)
+
+        screen.refrescar()
+        await _esperar(pilot, lambda: screen.ultimo_ok is not None)
+        await pilot.pause(0.3)
+
+        assert _titulo_preview(screen) == "Change the checkout payment flow"
+        assert len(screen.query(BloqueComentario)) == 3
+        assert backend.pedidos == [48], "sin conversación nueva, no se vuelve a preguntar"
