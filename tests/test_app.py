@@ -1260,7 +1260,7 @@ async def test_los_placeholders_de_los_inputs_se_leen():
             ("#nueva-filtro", "ilter repo"),
             ("#nueva-titulo", "what did they ask for?"),
             ("#nueva-notas", "notes, links, context (optional)"),
-            ("#nueva-fecha", "YYYY-MM-DD (optional)"),
+            ("#nueva-fecha", "YYYY-MM-DD · fri · +10d (optional)"),
         ):
             campo = modal.query_one(selector, Input)
             segmentos = [s for s in campo.render_line(0) if aguja in s.text]
@@ -2157,3 +2157,358 @@ async def test_la_linea_de_actividad_no_estira_el_detalle_fuera_de_la_pantalla(s
 
         assert detalle.query("#det-actividad")
         assert detalle.query_one("#dlg-detalle").outer_size.height <= size[1]
+
+
+# ------------------------------------------------------------------ fechas naturales
+async def _abrir_fecha(pilot, texto: str):
+    """Abre el modal de vencimiento sobre la tarea seleccionada y escribe `texto`."""
+    await pilot.press("d")
+    await _esperar(pilot, lambda: isinstance(pilot.app.screen, FechaScreen))
+    pilot.app.screen.query_one("#fecha-input", Input).value = texto
+    return pilot.app.screen
+
+
+@pytest.mark.parametrize(
+    ("escrito", "dias"),
+    [("+10d", 10), ("tomorrow", 1), ("today", 0), ("tom", 1)],
+)
+async def test_el_modal_de_fecha_resuelve_lo_que_se_escribe_en_ingles(escrito, dias):
+    """Lo que sale del modal es SIEMPRE ISO: `interpretar_fecha` traduce, la API ni se
+    entera de que existen `+10d` o `tom`."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        tarea = screen.seleccionada
+        await _abrir_fecha(pilot, escrito)
+        await pilot.press("ctrl+s")
+        await _esperar(pilot, lambda: not isinstance(pilot.app.screen, FechaScreen))
+        await pilot.pause(0.1)
+
+        actualizada = next(t for t in screen.tareas if t.item_id == tarea.item_id)
+        assert actualizada.vence == date.today() + timedelta(days=dias)
+
+
+async def test_el_modal_de_fecha_sigue_aceptando_el_formato_canonico():
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        screen = await _listo(pilot)
+        tarea = screen.seleccionada
+        await _abrir_fecha(pilot, "2027-03-09")
+        await pilot.press("ctrl+s")
+        await _esperar(pilot, lambda: not isinstance(pilot.app.screen, FechaScreen))
+        await pilot.pause(0.1)
+
+        actualizada = next(t for t in screen.tareas if t.item_id == tarea.item_id)
+        assert actualizada.vence == date(2027, 3, 9)
+
+
+async def test_una_fecha_que_no_se_entiende_avisa_y_no_cierra_el_modal():
+    """Mismo camino de error que antes: el aviso ocupa la fila del hint y el modal se
+    queda abierto para corregir, en vez de fechar cualquier cosa."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        modal = await _abrir_fecha(pilot, "asap")
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+        assert isinstance(pilot.app.screen, FechaScreen)
+        error = modal.query_one("#fecha-error")
+        assert error.display
+        assert "invalid date" in error.content
+        assert not modal.query_one("#fecha-hint").display
+
+
+async def test_el_alta_resuelve_la_fecha_natural_antes_de_crear():
+    app = TareasApp(BackendDemo(repo_actual="vela/landing"))
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        creada = await _crear_desde_modal(
+            pilot, screen, titulo="Call the client back", fecha="+2w"
+        )
+
+        assert creada.vence == date.today() + timedelta(weeks=2)
+
+
+async def test_el_alta_con_una_fecha_ilegible_avisa_y_no_crea_nada():
+    app = TareasApp(BackendDemo(repo_actual="vela/landing"))
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await pilot.press("n")
+        await pilot.pause()
+        modal = pilot.app.screen
+        modal.query_one("#nueva-titulo", Input).value = "Never created"
+        modal.query_one("#nueva-fecha", Input).value = "el viernes"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+        assert isinstance(pilot.app.screen, NuevaScreen)
+        assert "invalid date" in modal.query_one("#nueva-error").content
+        assert not any(t.titulo == "Never created" for t in screen.tareas)
+
+
+@pytest.mark.parametrize(
+    ("selector", "tecla"), [("#fecha-input", "d"), ("#nueva-fecha", "n")]
+)
+async def test_los_dos_campos_de_fecha_ensenan_los_formatos_que_aceptan(selector, tecla):
+    """El placeholder es la única documentación que se lee en el momento de escribir:
+    si dijera solo `YYYY-MM-DD`, `fri` y `+10d` no existirían para el usuario."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(110, 24)) as pilot:
+        await _listo(pilot)
+        await pilot.press(tecla)
+        await pilot.pause()
+
+        campo = pilot.app.screen.query_one(selector, Input)
+        assert campo.placeholder.startswith(datos.EJEMPLOS_FECHA)
+        # Y entra entero en su fila: un placeholder cortado enseñaría un formato falso.
+        assert len(campo.placeholder) <= campo.content_size.width
+
+
+# ------------------------------------------------------------------ filtro incremental
+async def _filtrar(pilot, texto: str) -> None:
+    """Abre el filtro con `/` y lo escribe tecla por tecla, como el usuario."""
+    await pilot.press("slash")
+    await pilot.pause()
+    await pilot.press(*texto)
+    await pilot.pause()
+
+
+def _titulos(screen) -> list[str]:
+    return [t.titulo for t in screen.visibles]
+
+
+async def test_la_fila_del_filtro_solo_existe_mientras_se_usa():
+    """En 80x15 la cabecera y el footer ya se llevan dos filas de quince: la del filtro
+    se paga solo mientras está en uso."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test(size=(80, 15)) as pilot:
+        screen = await _listo(pilot)
+        entrada = screen.query_one("#filtro", Input)
+        assert not entrada.display
+        assert screen.query_one("#tabla", TablaTareas).has_focus
+
+        await pilot.press("slash")
+        await pilot.pause()
+        assert entrada.display
+        assert entrada.has_focus
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not entrada.display
+        assert screen.query_one("#tabla", TablaTareas).has_focus
+
+
+async def test_el_filtro_busca_en_el_titulo_y_en_el_repo():
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+
+        await _filtrar(pilot, "checkout")
+        assert _titulos(screen) == ["Change the checkout payment flow"]
+
+        await pilot.press("escape")
+        await _filtrar(pilot, "vela")  # el nombre del repo, que la fila también muestra
+        assert _titulos(screen) == ["Upload the new homepage photos", "Tweak the homepage copy"]
+
+
+async def test_el_filtro_no_distingue_mayusculas():
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await _filtrar(pilot, "CHECKOUT")
+
+        assert _titulos(screen) == ["Change the checkout payment flow"]
+
+
+async def test_la_tabla_pinta_exactamente_lo_filtrado():
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await _filtrar(pilot, "homepage")
+        tabla = screen.query_one("#tabla", TablaTareas)
+
+        assert tabla.row_count == 2
+        assert len(screen.visibles) == 2
+
+
+async def test_el_filtro_se_combina_con_el_modo_repo():
+    """AND, no OR: filtrar dentro de «this repo» busca solo ahí. La misma aguja fuera
+    del modo repo sí encuentra la tarea del otro repo."""
+    app = TareasApp(BackendDemo(repo_actual="vela/landing"))
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        assert screen.modo_repo
+
+        await _filtrar(pilot, "renew")  # "Renew hosting…" vive en acme/web
+        assert screen.visibles == []
+
+        screen.action_toggle_repo()
+        await pilot.pause()
+        assert _titulos(screen) == ["Renew hosting and SSL certificate"]
+
+
+async def test_mientras_se_escribe_las_letras_son_texto_y_no_atajos():
+    """`n`, `d` y `x` abrirían modales desde la lista: con el foco en el filtro tienen
+    que escribirse, o buscar «nueva» sería imposible."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await _filtrar(pilot, "ndx")
+
+        assert isinstance(pilot.app.screen, ListaScreen)
+        assert screen.query_one("#filtro", Input).value == "ndx"
+
+
+async def test_enter_deja_el_filtro_puesto_y_devuelve_los_atajos():
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await _filtrar(pilot, "homepage")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert screen.query_one("#tabla", TablaTareas).has_focus
+        assert screen.query_one("#filtro", Input).display  # dice por qué la lista está corta
+        assert len(screen.visibles) == 2
+
+        await pilot.press("n")  # el atajo vuelve a disparar
+        await pilot.pause()
+        assert isinstance(pilot.app.screen, NuevaScreen)
+
+
+async def test_enter_con_el_filtro_vacio_devuelve_su_fila_a_la_lista():
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await pilot.press("slash")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert not screen.query_one("#filtro", Input).display
+        assert len(screen.visibles) == 7
+
+
+async def test_esc_limpia_el_filtro_y_devuelve_la_lista_entera():
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await _filtrar(pilot, "homepage")
+        assert len(screen.visibles) == 2
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert screen.filtro == ""
+        assert screen.query_one("#filtro", Input).value == ""
+        assert len(screen.visibles) == 7
+
+
+async def test_la_barra_vuelve_a_abrirse_para_editar_el_filtro_puesto():
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await _filtrar(pilot, "home")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        await pilot.press("slash")
+        await pilot.pause()
+        entrada = screen.query_one("#filtro", Input)
+        assert entrada.has_focus
+        assert entrada.value == "home"
+        assert entrada.cursor_position == len("home")  # se sigue escribiendo, no de cero
+
+        await pilot.press("p", "a", "g", "e")
+        await pilot.pause()
+        assert screen.filtro == "homepage"
+
+
+async def test_la_cabecera_dice_cuanto_esconde_el_filtro():
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await _filtrar(pilot, "vela")
+        texto = screen.query_one("#cab-titulo").content.plain
+
+        assert "2/7 pending" in texto
+        assert "1 overdue" in texto  # el conteo de vencidas también es del subconjunto
+
+
+async def test_sin_coincidencias_lo_dice_el_area_vacia_de_siempre():
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await _filtrar(pilot, "zzz")
+
+        vacio = screen.query_one("#vacio")
+        assert vacio.display
+        assert not screen.query_one("#tabla", TablaTareas).display
+        assert 'no tasks match "zzz"' in vacio.content.plain
+        # Y la cabecera no miente: hay pendientes, solo que ninguna coincide.
+        assert "no matches" in screen.query_one("#cab-titulo").content.plain
+
+
+async def test_el_refresco_de_fondo_no_pisa_el_filtro():
+    """El refresco cada 5 minutos repinta la lista entera: si no respetara el filtro, se
+    lo llevaría por delante justo mientras el usuario busca."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await _filtrar(pilot, "homepage")
+
+        screen.refrescar()
+        await _esperar(pilot, lambda: screen.ultimo_ok is not None)
+        await pilot.pause(0.1)
+
+        assert screen.filtro == "homepage"
+        assert screen.query_one("#filtro", Input).display
+        assert screen.query_one("#tabla", TablaTareas).row_count == 2
+
+
+async def test_el_pintado_desde_cache_tampoco_pisa_el_filtro():
+    """`_precargar` pinta la instantánea del disco antes de la red: pasa por el mismo
+    `_pintar_tabla`, así que tiene que respetar el filtro igual que el refresco."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        await _filtrar(pilot, "homepage")
+
+        screen._pintar_tabla()
+        await pilot.pause()
+
+        assert screen.query_one("#tabla", TablaTareas).row_count == 2
+
+
+def _footer(screen) -> dict[str, str]:
+    """Lo que el footer anuncia ahora mismo: tecla → descripción."""
+    return {
+        tecla: activo.binding.description
+        for tecla, activo in screen.active_bindings.items()
+        if activo.binding.show
+    }
+
+
+async def test_el_footer_no_promete_atajos_que_no_disparan_mientras_se_escribe():
+    """La lección del #37: con el foco en el filtro, `n`/`d`/`x` son texto y no atajos,
+    así que el footer no puede seguir anunciándolos. Y `esc` aparece solo cuando hay un
+    filtro que limpiar."""
+    app = TareasApp(BackendDemo())
+    async with app.run_test() as pilot:
+        screen = await _listo(pilot)
+        assert _footer(screen) == {
+            "enter": "view", "n": "new", "d": "date", "x": "close",
+            "r": "refresh", "slash": "filter", "q": "quit",
+        }
+
+        await pilot.press("slash")
+        await pilot.pause()
+        assert _footer(screen) == {"enter": "apply", "escape": "clear"}
+
+        # Con el filtro puesto y el foco de vuelta en la tabla, los atajos vuelven y
+        # `esc` se queda a la vista: es la salida del filtro.
+        await pilot.press("h", "o", "m", "e", "enter")
+        await pilot.pause()
+        assert _footer(screen)["enter"] == "view"
+        assert _footer(screen)["escape"] == "clear"

@@ -28,7 +28,11 @@ the opposite:
   app starts filtered to that repo, with a toggle (`t`, or a click on
   "all"/"this repo") to switch to the full list and back.
 - **Quick-pick due dates.** Set a due date with one click — today, tomorrow, +3
-  days, next week, +1 month — or type an exact `YYYY-MM-DD`.
+  days, next week, +1 month — or type it the way you'd say it: `fri`, `+10d`,
+  `aug 20`, or the exact `YYYY-MM-DD`.
+- **Incremental filter.** `/` opens a one-line filter that narrows the list as you
+  type, over titles and repo names, and combines with repo mode. Its row only
+  exists while you're using it.
 - **Recurring tasks.** Mark a task as daily, weekly, biweekly or monthly and
   closing it opens the next occurrence automatically.
 - **Auto-refresh.** The list reloads itself every 5 minutes; the header shows how
@@ -144,6 +148,9 @@ always cancels or goes back, and it's spelled out in each dialog's hint line.
 | `r` | list | Reload |
 | `t` | list | Toggle between "all" and "this repo" (only inside a repo) |
 | `g` / `G` | list | Jump to the first / last task |
+| `/` | list | Filter the list as you type |
+| `enter` | filter | Keep the filter and go back to the list |
+| `esc` | filter | Clear the filter and close its row |
 | `q` | list | Quit |
 | `j` / `k` | detail | Scroll the body |
 | `x` | detail | Close the task (same key as in the list) |
@@ -196,6 +203,23 @@ Creating a task (`n`) in repo mode preselects that repo without opening the
 repo picker — it only asks for a title, a description and a date. If you'd rather
 pick a different repo, click the fixed repo label (or press `ctrl+p`) to reveal the
 normal picker.
+
+### Filtering the list
+
+`/` opens a one-line filter above the list, and the list narrows *as you type*. The
+match is a plain case-insensitive substring over the task title and the repo name —
+nothing fuzzy, so what you type is what you get.
+
+While the filter has the focus, letters are text and not shortcuts, so the footer
+stops advertising the ones that wouldn't fire (`n`, `d`, `x`…) and offers the two
+that do: `enter` keeps the filter and hands the focus back to the list — shortcuts
+work again there, and the filter row stays visible as the reminder of why the list
+is short — and `esc` clears it and gives that row back to the tasks. Pressing `/`
+again reopens the filter to edit what's already in it.
+
+The filter and repo mode combine (both apply at once), the header counts the subset
+you're looking at (`3/12 pending`), and a background reload never wipes it: the list
+keeps filtering while it refreshes.
 
 ### Creating a task
 
@@ -267,8 +291,22 @@ extra round trip: refreshing takes as long as it always did.
 ### Setting a due date without typing
 
 The due date dialog has clickable shortcuts — *today*, *tomorrow*, *+3 days*,
-*next week*, *+1 month* — and also accepts an exact date as `YYYY-MM-DD`. The
-*clear* button removes the due date.
+*next week*, *+1 month* — and the *clear* button removes the due date.
+
+When the date you want isn't one of those five, type it the way you'd say it. Both
+date fields (the due-date dialog and the new-task one) take the same thing, in
+English and ignoring case:
+
+| What you type | What you get |
+|---|---|
+| `2026-08-20` | that date — the canonical format, and what gets stored |
+| `today` · `tomorrow` (or `tom`) | today · tomorrow |
+| `+10d` · `+2w` · `+3m` | days, weeks and calendar months from today |
+| `fri` · `friday` | the *next* Friday — on a Friday, it means the next one, never today |
+| `aug 20` · `20 aug` | that day; if it's already gone this year, next year's |
+
+Anything else is rejected in place, with the dialog still open, instead of saving a
+half-understood date: a due date you can't trust is worse than no due date.
 
 | Detail | Due date |
 |---|---|
@@ -294,7 +332,10 @@ tareas add "Fix the checkout bug" --repo vela/landing --due 2026-09-10
   Without it, `tareas add` falls back to the same contextual detection as the
   TUI: the repo of the directory you're running it from; if that can't be
   resolved either, it fails and asks for `--repo`.
-- `--due` accepts `YYYY-MM-DD` or `DD-MM-YYYY`. Without it the task has no due date.
+- `--due` accepts everything the app's date fields do (`2026-09-10`, `today`,
+  `tom`, `fri`, `+10d`, `aug 20`) plus `DD-MM-YYYY`. A date it can't read fails
+  before the first call to GitHub, with exit code `2` and nothing created. Without
+  `--due` the task has no due date.
 - `--notes "…"` sets the issue body. For anything long or multiline — the usual
   case when an agent is filing a full spec — pass `--notes -` and pipe it in
   instead of fighting shell quoting:
@@ -377,6 +418,8 @@ The code is five modules: `config.py` (configuration and ID resolution),
 the last good read), `app.py` (the interface), and `__main__.py` (the entry point and
 the `add` subcommand). Tests are split the same way:
 `tests/test_repeticion.py` covers the recurrence math on its own,
+`tests/test_fechas.py` covers what the date fields accept (`fri`, `+10d`, `aug 20`)
+against a fixed "today",
 `tests/test_backend.py` covers the `gh` layer (timeouts, orphaned subprocesses,
 partial writes, the item limit, a renamed date field) against a fake `gh`,
 `tests/test_cache.py` covers the disk cache (round trip, corrupt or stale files,

@@ -13,21 +13,32 @@ from datetime import date
 def _analizar_fecha(valor: str) -> str:
     """Valida `--due` y lo devuelve en ISO, que es lo que pide la API.
 
-    Acepta `YYYY-MM-DD` (igual que la TUI) y `DD-MM-YYYY` (formato local), a
-    diferencia de `datos.parsear_fecha`: esa es tolerante a propósito -un valor
-    corrupto en el caché no puede tumbar la app-, y acá el CLI necesita lo
-    contrario, que un valor mal escrito falle con un mensaje claro.
+    Acepta exactamente lo mismo que los campos de fecha de la TUI (`YYYY-MM-DD`,
+    `today`, `tom`, `fri`, `+10d`, `aug 20`: ver `datos.interpretar_fecha`) más
+    `DD-MM-YYYY`, el formato local que se escribe de memoria y que la TUI no necesita
+    porque ahí se elige con los quick-picks.
+
+    Va como `type=` de argparse a propósito: así una fecha mal escrita sale por stderr
+    con código 2 ANTES de la primera llamada a `gh`, igual que el título vacío.
+
+    `datos.interpretar_fecha` y no `datos.parsear_fecha`: esta última es tolerante a
+    propósito -un valor corrupto en el caché no puede tumbar la app- y acá hace falta
+    lo contrario, que lo que está mal escrito falle con un mensaje claro.
     """
-    try:
-        return date.fromisoformat(valor).isoformat()
-    except ValueError:
-        pass
+    # Import local, como el resto del módulo: los caminos que salen temprano (sin
+    # terminal, sin `gh`, sin config) no tienen por qué pagar el arranque de `rich`.
+    from .datos import interpretar_fecha
+
+    fecha = interpretar_fecha(valor, date.today())
+    if fecha is not None:
+        return fecha.isoformat()
     try:
         dia, mes, ano = valor.split("-")
         return date(int(ano), int(mes), int(dia)).isoformat()
     except (ValueError, IndexError):
         raise argparse.ArgumentTypeError(
-            f"invalid date {valor!r} (use YYYY-MM-DD or DD-MM-YYYY)"
+            f"invalid date {valor!r} (use YYYY-MM-DD, DD-MM-YYYY, or plain English "
+            "like today, fri, +10d, aug 20)"
         ) from None
 
 
@@ -48,7 +59,10 @@ def _cmd_add(argv: list[str]) -> int:
         "--repo", help="owner/repo, or just repo (uses the configured owner)"
     )
     analizador.add_argument(
-        "--due", type=_analizar_fecha, help="due date: YYYY-MM-DD or DD-MM-YYYY"
+        "--due",
+        type=_analizar_fecha,
+        help="due date: YYYY-MM-DD, DD-MM-YYYY, or plain English "
+        "(today, tom, fri, +10d, +2w, aug 20)",
     )
     analizador.add_argument(
         "--notes",

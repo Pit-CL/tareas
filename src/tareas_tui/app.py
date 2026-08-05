@@ -36,6 +36,7 @@ from textual.widgets.option_list import Option
 from .datos import (
     ANCHO_REPEAT,
     ANCHO_VENCE,
+    EJEMPLOS_FECHA,
     LIMITE_ITEMS,
     REPETICIONES,
     SECUNDARIO,
@@ -49,6 +50,7 @@ from .datos import (
     componer_cuerpo,
     etiqueta_vencimiento,
     fecha_larga,
+    interpretar_fecha,
     mas_un_mes,
     ordenar,
     parsear_fecha,
@@ -71,6 +73,9 @@ VIDA_NACIENTES = 120.0
 # 22 es el primer alto donde entra entero con margen. Debajo, layout compacto.
 UMBRAL_HOLGADO = 22
 ANCHO_ETIQUETA_REPEAT = max(len(r) for r in REPETICIONES)
+# Fecha que no se entiende: el mismo aviso en los dos campos que la aceptan, y de paso
+# vuelve a enseñar los formatos (el placeholder ya no está a la vista cuando hay texto).
+ERROR_FECHA = f"invalid date, try {EJEMPLOS_FECHA}"
 
 # ------------------------------------------------------------------------------------
 # Theme: hereda la paleta ANSI del terminal en vez de fijar colores propios.
@@ -428,6 +433,10 @@ class DetalleScreen(DialogoModal):
 class FechaScreen(DialogoModal):
     """Elegir vencimiento. Devuelve 'AAAA-MM-DD', '' para quitarlo, o None.
 
+    Lo que se escribe pasa por `interpretar_fecha`, así que además del formato canónico
+    entran `fri`, `+10d` o `aug 20`; lo que sale del modal es SIEMPRE ISO, que es lo
+    único que la API entiende.
+
     Todo lo que no sea un quick-pick va con `ctrl+letra`: hay un Input con el foco y
     Textual deja que se quede con cualquier tecla imprimible antes que un binding,
     por prioritario que sea. `ctrl+enter` queda de bonus para quien tenga el protocolo
@@ -456,7 +465,7 @@ class FechaScreen(DialogoModal):
             with Horizontal(classes="fila-botones"):
                 yield InputFecha(
                     value=self.actual.isoformat() if self.actual else "",
-                    placeholder="YYYY-MM-DD",
+                    placeholder=EJEMPLOS_FECHA,
                     id="fecha-input",
                 )
                 yield Button("\\[^s·save]", id="fecha-guardar", classes="chip primario")
@@ -508,12 +517,11 @@ class FechaScreen(DialogoModal):
         if not texto:
             self.dismiss("")
             return
-        try:
-            date.fromisoformat(texto)
-        except ValueError:
-            self._avisar("invalid format, use YYYY-MM-DD")
+        fecha = interpretar_fecha(texto, date.today())
+        if fecha is None:
+            self._avisar(ERROR_FECHA)
             return
-        self.dismiss(texto)
+        self.dismiss(fecha.isoformat())
 
 
 class NuevaScreen(DialogoModal):
@@ -574,7 +582,9 @@ class NuevaScreen(DialogoModal):
             yield Static("", classes="respiro")
             yield AtajosFecha(classes="fila-chips")
             with Horizontal(classes="fila-fecha"):
-                yield InputFecha(placeholder="YYYY-MM-DD (optional)", id="nueva-fecha")
+                yield InputFecha(
+                    placeholder=f"{EJEMPLOS_FECHA} (optional)", id="nueva-fecha"
+                )
                 yield Button(self._etiqueta_repeat(), id="nueva-repeat", classes="chip")
             yield Static("", classes="respiro")
             with Horizontal(classes="fila-botones"):
@@ -750,12 +760,14 @@ class NuevaScreen(DialogoModal):
             self.query_one("#nueva-titulo", Input).focus()
             return
         if fecha:
-            try:
-                date.fromisoformat(fecha)
-            except ValueError:
-                self._avisar("invalid date, use YYYY-MM-DD")
+            # El alta viaja siempre en ISO: `fri` o `+10d` se resuelven acá, con el
+            # modal todavía abierto, para que un error se corrija en el acto.
+            vence = interpretar_fecha(fecha, date.today())
+            if vence is None:
+                self._avisar(ERROR_FECHA)
                 self.query_one("#nueva-fecha", Input).focus()
                 return
+            fecha = vence.isoformat()
         repeticion = self.repeticion
         if repeticion != "none" and not fecha:
             # Sin vencimiento no hay desde dónde contar el intervalo: se crea igual,
@@ -818,21 +830,36 @@ class ConfirmaScreen(DialogoModal):
 # Pantalla principal
 # ------------------------------------------------------------------------------------
 class ListaScreen(Screen):
+    #: El foco arranca SIEMPRE en la tabla. Hace falta decirlo desde que existe la fila
+    #: del filtro: el auto-foco de Textual se queda con el primer widget «focusable» del
+    #: DOM y esa prueba mira `visibility`, no `display`, así que la fila escondida se lo
+    #: llevaba y ninguna tecla de la lista disparaba (todas se iban al Input).
+    AUTO_FOCUS = "#tabla"
+
     BINDINGS = [
         # priority: DataTable también usa enter, y sin esto su binding (oculto) gana
         # el desempate y el footer se queda sin la pista más importante.
         Binding("enter", "ver", "view", priority=True),
+        # El mismo enter mientras se escribe el filtro: los dos son prioritarios y
+        # `check_action` decide cuál vale, así que nunca compiten (ver `check_action`).
+        Binding("enter", "aplicar_filtro", "apply", priority=True),
         Binding("n", "nueva", "new"),
         Binding("d", "fecha", "date"),
         Binding("x", "cerrar", "close"),
         Binding("r", "refrescar", "refresh"),
         Binding("t", "toggle_repo", "repo"),
+        Binding("slash", "filtrar", "filter"),
+        Binding("escape", "limpiar_filtro", "clear"),
         Binding("q", "salir", "quit"),
         Binding("j", "abajo", "", show=False),
         Binding("k", "arriba", "", show=False),
         Binding("g", "inicio", "", show=False),
         Binding("G", "fin", "", show=False),
     ]
+
+    #: Lo único que sigue disparando mientras el foco está en el filtro: ahí las letras
+    #: son texto, no atajos, y el footer no puede prometer los que no funcionan (#37).
+    ACCIONES_FILTRO = frozenset({"aplicar_filtro", "limpiar_filtro"})
 
     def __init__(self, backend: Backend) -> None:
         super().__init__()
@@ -841,6 +868,10 @@ class ListaScreen(Screen):
         self.repos: list[str] = []
         self.repo_actual: str | None = None
         self.modo_repo = False
+        # Texto del filtro incremental ("" es sin filtro). Vive acá y no en el Input
+        # porque la fila del filtro va y viene, y el filtro tiene que sobrevivir a los
+        # repintados -el refresco de fondo entre ellos-, no al revés.
+        self.filtro = ""
         self.ultimo_ok: datetime | None = None
         self.ultimo_error: str | None = None
         self.cargando = True
@@ -880,6 +911,15 @@ class ListaScreen(Screen):
             yield BotonCabecera("", "toggle_repo", id="cab-toggle", classes="cab-btn")
             yield BotonCabecera("+ new", "nueva", id="cab-nueva", classes="cab-btn")
             yield BotonCabecera("⟳", "refrescar", id="cab-refrescar", classes="cab-btn")
+        # Nace escondido (`display: none` en el CSS) y solo aparece mientras el filtro
+        # está activo: en 80x15 la cabecera y el footer ya se llevan dos filas de
+        # quince, y una tercera permanente sería una tarea menos a la vista.
+        # `select_on_focus=False` porque `/` con un filtro puesto es para EDITARLO: con
+        # el default de Textual (seleccionar todo al enfocar) la primera tecla borraba
+        # lo que ya estaba escrito y había que volver a tipear la búsqueda entera.
+        yield Input(
+            placeholder="filter · title or repo", id="filtro", select_on_focus=False
+        )
         tabla = TablaTareas(id="tabla")
         tabla.cursor_type = "row"
         tabla.show_header = False
@@ -1041,7 +1081,7 @@ class ListaScreen(Screen):
 
     # ------------------------------------------------------------------ pintado
     @property
-    def visibles(self) -> list[Tarea]:
+    def del_repo(self) -> list[Tarea]:
         """`tareas`, filtradas al repo actual cuando el modo repo está activo.
 
         El filtro es client-side sobre la misma lista del Project; `tareas` sigue
@@ -1050,6 +1090,25 @@ class ListaScreen(Screen):
         if self.modo_repo and self.repo_actual:
             return [t for t in self.tareas if t.repo == self.repo_actual]
         return self.tareas
+
+    @property
+    def visibles(self) -> list[Tarea]:
+        """Lo que la tabla pinta: el modo repo Y el filtro incremental, combinados.
+
+        Los dos se suman (AND): filtrar estando en «this repo» busca solo ahí. La
+        búsqueda es substring simple sobre el título y el nombre del repo, sin importar
+        la caja -es lo que la fila muestra, así que es lo que se busca- y sin nada de
+        fuzzy: escribir «check» y que aparezca una tarea sin esa palabra sería peor que
+        no encontrarla.
+        """
+        if not self.filtro:
+            return self.del_repo
+        aguja = self.filtro.casefold()
+        return [
+            t
+            for t in self.del_repo
+            if aguja in t.titulo.casefold() or aguja in t.repo.casefold()
+        ]
 
     @property
     def _pintable(self) -> bool:
@@ -1197,6 +1256,15 @@ class ListaScreen(Screen):
                     ("press r or click ⟳ to retry", SECUNDARIO),
                 )
             )
+        elif self.filtro:
+            # No es un estado feliz -hay tareas, solo que ninguna coincide-, así que no
+            # lleva el ✓ verde de los otros dos: es el filtro el que hay que cambiar.
+            widget.update(
+                Text.assemble(
+                    (f'no tasks match "{acortar(self.filtro, 40)}"\n\n', "bold yellow"),
+                    ("press esc to clear the filter", SECUNDARIO),
+                )
+            )
         elif self.modo_repo and self.repo_actual:
             widget.update(
                 Text.assemble(
@@ -1229,10 +1297,12 @@ class ListaScreen(Screen):
         elif self.ultimo_error:
             estado = [("no connection", "yellow")]
         elif cuantas == 0:
-            estado = [("nothing pending", "yellow")]
+            # Con el filtro puesto NO es que no haya pendientes: es que ninguna coincide,
+            # y decir "nothing pending" mandaría a cerrar la app tranquilo.
+            estado = [("no matches" if self.filtro else "nothing pending", "yellow")]
         elif vencidas:
             estado = [
-                (f"{cuantas} pending", "yellow"),
+                (f"{self._conteo(cuantas)} pending", "yellow"),
                 (" · ", "dim"),
                 # Token invertido: "reverse" pone el rojo de fondo y el texto en el
                 # color por defecto de la terminal, así el contraste queda garantizado
@@ -1242,7 +1312,7 @@ class ListaScreen(Screen):
                 (f" {vencidas} overdue ", "bold red reverse"),
             ]
         else:
-            estado = [(f"{cuantas} pending", "yellow")]
+            estado = [(f"{self._conteo(cuantas)} pending", "yellow")]
         estado_texto = "".join(texto for texto, _ in estado)
 
         if self.modo_repo and self.repo_actual:
@@ -1275,6 +1345,14 @@ class ListaScreen(Screen):
             Text(f"⟳ {self._hace_cuanto()}", style=SECUNDARIO)
         )
 
+    def _conteo(self, cuantas: int) -> str:
+        """«3» normalmente; «3/12» con el filtro puesto.
+
+        El total es el del modo en curso (todas o el repo actual), así que el segundo
+        número dice exactamente cuánto está escondiendo el filtro y no otra cosa.
+        """
+        return f"{cuantas}/{len(self.del_repo)}" if self.filtro else str(cuantas)
+
     def _hace_cuanto(self) -> str:
         if self.ultimo_ok is None:
             return "—"
@@ -1288,9 +1366,79 @@ class ListaScreen(Screen):
 
     # ------------------------------------------------------------------ interacción
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Qué atajos valen AHORA. False esconde el binding del footer y le impide
+        disparar (Textual reserva None para «visible pero apagado»).
+
+        Es lo que sostiene las dos caras del filtro: mientras el Input tiene el foco las
+        letras son texto y no atajos, así que el footer no anuncia ni uno solo de los
+        que no funcionan; y el mismo `enter` sirve para abrir el detalle o para dejar el
+        filtro puesto según dónde esté el foco, sin que los dos bindings compitan.
+        """
+        if self._filtro_enfocado:
+            return action in self.ACCIONES_FILTRO
+        if action == "aplicar_filtro":
+            return False  # sin el foco en el filtro, enter es «ver el detalle»
+        if action == "limpiar_filtro":
+            return self._filtrando
         if action == "toggle_repo":
             return self.repo_actual is not None
         return True
+
+    # ------------------------------------------------------------------ filtro
+    @property
+    def _filtrando(self) -> bool:
+        """True mientras la fila del filtro está en pantalla (con o sin foco)."""
+        entradas = self.query("#filtro")
+        return bool(entradas) and entradas.first().display
+
+    @property
+    def _filtro_enfocado(self) -> bool:
+        entradas = self.query("#filtro")
+        return bool(entradas) and entradas.first().has_focus
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        # El footer cambia con el foco (ver `check_action`), y el foco también se mueve
+        # con el mouse -un clic en la tabla saca del filtro-, así que se recalcula acá
+        # y no en cada acción.
+        self.refresh_bindings()
+
+    def action_filtrar(self) -> None:
+        """`/`: abre la fila del filtro, o la vuelve a enfocar si ya estaba puesta."""
+        entrada = self.query_one("#filtro", Input)
+        entrada.display = True
+        entrada.focus()
+        # Reabrir con un filtro puesto es para editarlo, no para empezar de cero: el
+        # cursor va al final del texto que ya está.
+        entrada.cursor_position = len(entrada.value)
+        self.refresh_bindings()
+
+    def action_aplicar_filtro(self) -> None:
+        """`enter`: el filtro queda puesto y el foco vuelve a la tabla, donde x/d/n
+        son atajos otra vez. La fila sigue a la vista: es lo que dice por qué la lista
+        está corta."""
+        if not self.query_one("#filtro", Input).value.strip():
+            self.action_limpiar_filtro()
+            return
+        self.query_one("#tabla", TablaTareas).focus()
+        self.refresh_bindings()
+
+    def action_limpiar_filtro(self) -> None:
+        """`esc`: saca el filtro y devuelve su fila a la lista."""
+        entrada = self.query_one("#filtro", Input)
+        entrada.value = ""
+        entrada.display = False
+        self.filtro = ""
+        self.query_one("#tabla", TablaTareas).focus()
+        self._pintar_tabla()
+        self.refresh_bindings()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "filtro":
+            return
+        event.stop()
+        # Filtra mientras se escribe: son ~7 tareas en memoria, no hay nada que debouncear.
+        self.filtro = event.value.strip()
+        self._pintar_tabla()
 
     @property
     def seleccionada(self) -> Tarea | None:
@@ -1654,15 +1802,27 @@ class TareasApp(App):
        marcador era invisible, así que un Input sin foco no se distinguía de una
        línea de texto -de ahí que el campo de notas pasara desapercibido-. Con foco
        salta a ansi_yellow, así que se sigue viendo cuál está activo. */
-    #nueva-filtro, #nueva-titulo, #nueva-notas, #nueva-fecha, #fecha-input {
+    #nueva-filtro, #nueva-titulo, #nueva-notas, #nueva-fecha, #fecha-input, #filtro {
         height: 1; border: none; border-left: solid ansi_white; padding: 0 1;
         background: $background; width: 1fr;
     }
     #nueva-filtro:focus, #nueva-titulo:focus, #nueva-notas:focus,
-    #nueva-fecha:focus, #fecha-input:focus {
+    #nueva-fecha:focus, #fecha-input:focus, #filtro:focus {
         border-left: solid ansi_yellow;
     }
-    #nueva-fecha, #fecha-input { max-width: 24; }
+    /* La fila del filtro de la lista nace escondida y solo existe mientras el filtro
+       está activo (la muestra `action_filtrar`, la esconde `action_limpiar_filtro`):
+       en 80x15 la cabecera y el footer ya se llevan dos filas de quince, así que la
+       tercera se paga solo cuando se está usando. */
+    #filtro { display: none; }
+    /* Cada campo de fecha mide lo que su placeholder necesita (el Input se come 3
+       columnas entre el borde izquierdo y el padding): "YYYY-MM-DD · fri · +10d" son
+       23 caracteres y pide 26, y la variante con " (optional)" son 34 y pide 37. A 80
+       columnas las dos filas siguen entrando en los 68 útiles del diálogo: los tres
+       botones de la fecha se llevan 36 (30+36=66) y el chip de repetición 24
+       (37+24=61). */
+    #fecha-input { max-width: 30; }
+    #nueva-fecha { max-width: 37; }
 
     /* Los placeholders dicen QUÉ va en cada campo: se leen. El theme ansi de Textual
        los pinta con `text-style: dim` sobre ansi_default (ver Input.DEFAULT_CSS, rama
