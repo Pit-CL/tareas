@@ -101,6 +101,16 @@ def test_add_sin_repo_detecta_el_del_cwd(monkeypatch, capsys):
     assert falso.variables_de("IdDeRepo") == {"owner": "acme", "nombre": "site"}
 
 
+def test_add_el_titulo_se_recorta_de_espacios(monkeypatch, capsys):
+    falso = GhFalso()
+    _instalar(monkeypatch, falso)
+
+    codigo = entrada._cmd_add(["  Renew SSL  ", "--repo", "pit/web"])
+
+    assert codigo == 0
+    assert falso.variables_de("CrearIssue")["titulo"] == "Renew SSL"
+
+
 def test_add_notas_desde_stdin(monkeypatch, capsys):
     falso = GhFalso()
     _instalar(monkeypatch, falso)
@@ -134,6 +144,19 @@ def test_add_fecha_invalida_sale_con_2_sin_tocar_github(monkeypatch, capsys):
     assert salida.value.code == 2
     assert "invalid date" in capsys.readouterr().err
     assert falso.usados == []  # argparse cortó antes de hablarle a `gh`
+
+
+def test_add_titulo_vacio_o_solo_espacios_sale_con_2_sin_tocar_github(monkeypatch, capsys):
+    # Mismo criterio que `NuevaScreen._crear` ("title is required"): una plantilla mal
+    # armada no debe crear un issue en blanco en GitHub.
+    falso = GhFalso()
+    _instalar(monkeypatch, falso)
+
+    codigo = entrada._cmd_add(["   ", "--repo", "pit/web"])
+
+    assert codigo == 2
+    assert "title is required" in capsys.readouterr().err
+    assert falso.usados == []  # se corta antes de hablarle a `gh`
 
 
 def test_add_efecto_parcial_se_reporta_con_la_url_y_sale_con_2(monkeypatch, capsys):

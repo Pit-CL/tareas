@@ -839,6 +839,12 @@ class ListaScreen(Screen):
         # veces (`gh issue close` sobre un issue ya cerrado sale 0), duplicando de paso
         # la siguiente ocurrencia de las repetitivas.
         self.ocupadas: dict[str, str] = {}
+        # True mientras hay un modal de `_mostrar_modal` en pantalla. Un doble clic o
+        # dos teclas casi simultáneas agendan dos workers ANTES de que el primero
+        # llegue a montar su modal (`action_ver`, `action_fecha`, `action_cerrar` y
+        # `action_nueva` no son exclusivos: ver el comentario de `_mostrar_modal`), y
+        # sin este guard el segundo disparo apilaba una SEGUNDA pantalla idéntica.
+        self._modal_abierto = False
         self.limite_avisado = False
         # item_ids cerrados desde acá que el Project todavía puede devolver como
         # pendientes: el Status "Done" lo pone un workflow de Projects DESPUÉS de que
@@ -1308,12 +1314,30 @@ class ListaScreen(Screen):
     def action_salir(self) -> None:
         self.app.exit()
 
+    async def _mostrar_modal(self, pantalla: ModalScreen) -> object:
+        """Abre `pantalla`; un segundo disparo mientras ya hay un modal en pantalla no
+        hace nada (mismo resultado que si el usuario lo hubiera cancelado).
+
+        No sirve poner `exclusive=True` en el `@work` de estas acciones: cancelaría el
+        worker que sigue esperando el `push_screen_wait` del PRIMER modal y lo dejaría
+        huérfano en el `screen_stack` en vez de evitar el segundo. El guard va acá,
+        ANTES de empujar la pantalla, así que la segunda `pantalla` construida por el
+        llamador ni llega a montarse.
+        """
+        if self._modal_abierto:
+            return None
+        self._modal_abierto = True
+        try:
+            return await self.app.push_screen_wait(pantalla)
+        finally:
+            self._modal_abierto = False
+
     @work
     async def action_ver(self) -> None:
         tarea = self.seleccionada
         if tarea is None:
             return
-        siguiente = await self.app.push_screen_wait(DetalleScreen(tarea))
+        siguiente = await self._mostrar_modal(DetalleScreen(tarea))
         if siguiente == "cerrar":
             await self._cerrar(tarea)
         elif siguiente == "fecha":
@@ -1338,9 +1362,7 @@ class ListaScreen(Screen):
     @work
     async def action_nueva(self) -> None:
         repo_prefijado = self.repo_actual if self.modo_repo else None
-        datos = await self.app.push_screen_wait(
-            NuevaScreen(self.obtener_repos, repo_prefijado)
-        )
+        datos = await self._mostrar_modal(NuevaScreen(self.obtener_repos, repo_prefijado))
         if not datos:
             return
         try:
@@ -1396,7 +1418,7 @@ class ListaScreen(Screen):
     async def _fechar(self, tarea: Tarea) -> None:
         if self._ocupada(tarea):
             return
-        nueva = await self.app.push_screen_wait(FechaScreen(tarea.titulo, tarea.vence))
+        nueva = await self._mostrar_modal(FechaScreen(tarea.titulo, tarea.vence))
         if nueva is None:
             return
         self._ocupar(tarea, "saving…")
@@ -1420,7 +1442,7 @@ class ListaScreen(Screen):
         if self._ocupada(tarea):
             return
         pregunta = f'close "{acortar(tarea.titulo, 60)}"?'
-        if not await self.app.push_screen_wait(ConfirmaScreen(pregunta)):
+        if not await self._mostrar_modal(ConfirmaScreen(pregunta)):
             return
         self._ocupar(tarea, "closing…")
         try:

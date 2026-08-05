@@ -63,6 +63,14 @@ def _cmd_add(argv: list[str]) -> int:
     # stdin (heredoc típico) es la vía robusta para notas largas.
     notas = sys.stdin.read() if args.notes == "-" else args.notes
 
+    # Mismo criterio que `NuevaScreen._crear`: un título vacío (o solo espacios, típico
+    # de una plantilla mal armada) no debe llegar a crear un issue en GitHub. Se corta
+    # acá, antes de cualquier llamada a `gh`.
+    titulo = args.titulo.strip()
+    if not titulo:
+        print("tareas: title is required", file=sys.stderr)
+        return 2
+
     if shutil.which("gh") is None:
         print("tareas: needs GitHub CLI (https://cli.github.com)", file=sys.stderr)
         return 2
@@ -89,7 +97,7 @@ def _cmd_add(argv: list[str]) -> int:
                 raise ErrorConfig(
                     "couldn't detect a repo from the current directory — pass --repo"
                 )
-        return await backend.crear(repo, args.titulo, args.due, notas.strip())
+        return await backend.crear(repo, titulo, args.due, notas.strip())
 
     try:
         creada = asyncio.run(_crear())

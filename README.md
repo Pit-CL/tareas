@@ -366,16 +366,18 @@ TAREAS_DEMO=1 .venv/bin/python -m tareas_tui     # sample data, no GitHub calls
 what's used for this README's screenshots. `BackendDemo(repo_actual="owner/repo")`
 also simulates contextual repo mode without touching GitHub.
 
-The code is four modules: `config.py` (configuration and ID resolution),
+The code is five modules: `config.py` (configuration and ID resolution),
 `datos.py` (`gh` calls, date math and formatting), `cache.py` (the on-disk copy of
-the last good read), and `app.py` (the interface). Tests are split the same way:
+the last good read), `app.py` (the interface), and `__main__.py` (the entry point and
+the `add` subcommand). Tests are split the same way:
 `tests/test_repeticion.py` covers the recurrence math on its own,
 `tests/test_backend.py` covers the `gh` layer (timeouts, orphaned subprocesses,
 partial writes, the item limit, a renamed date field) against a fake `gh`,
 `tests/test_cache.py` covers the disk cache (round trip, corrupt or stale files,
 and that the demo never touches it), `tests/test_arranque.py` covers the entry
-point guards (no terminal, unreadable config), and `tests/test_app.py` drives the
-interface with textual's Pilot. The whole
+point guards (no terminal, unreadable config), `tests/test_app.py` drives the
+interface with textual's Pilot, and `tests/test_cli_add.py` covers `tareas add`
+against the same fake `gh`. The whole
 suite runs without the GitHub CLI installed and without credentials or network,
 which is what CI does on Python 3.11 and 3.12 — and `tests/conftest.py` points
 `XDG_CONFIG_HOME` at a temporary directory so it never reads or writes the config
