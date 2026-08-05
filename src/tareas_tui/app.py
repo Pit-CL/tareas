@@ -135,21 +135,25 @@ THEME_TERMINAL = Theme(
 # Piezas reutilizables
 # ------------------------------------------------------------------------------------
 class TablaTareas(DataTable):
-    """DataTable cuya fila bajo el cursor conserva el color semántico de cada celda.
+    """DataTable cuya fila bajo el cursor se lee entera, sin `dim`.
 
-    Se construye con `cursor_foreground_priority="renderable"`: por default Textual
-    pisa el **color** del renderable con el del cursor (`Style.from_color(...)` en el
-    `post_style` de la celda), así que toda la fila -vencida en rojo, hoy en acento,
-    lejana en color 7- se aplanaba al mismo color al seleccionarla. Con "renderable"
-    ese `post_style` no toca el color y cada celda mantiene el suyo sobre la barra de
-    selección; el fondo lo sigue poniendo el cursor (`cursor_background_priority`
-    default, no se toca), así que la fila sigue siendo obviamente la seleccionada.
+    `cursor_foreground_priority="css"` (el default) solo pisa el **color** del
+    renderable: Textual lo aplica como `Style.from_color(color=...)` en el `post_style`
+    de la celda, y ahí no hay forma de tocar los atributos. Una celda marcada `dim`
+    -la columna de repo, o un vencimiento lejano- se seguía difuminando contra el fondo
+    del cursor (el filtro ANSI resuelve `dim` mezclando texto y fondo), y sobre el
+    ámbar quedaba ilegible. Sumamos `dim=False` a ese mismo `post_style`, que es el
+    único punto del pipeline donde se puede cancelar un atributo del renderable.
 
-    Eso no alcanza para los *atributos*: una celda marcada `dim` -la columna de repo,
-    o un vencimiento lejano- se seguía difuminando contra el fondo del cursor (el
-    filtro ANSI resuelve `dim` mezclando texto y fondo), y sobre el ámbar quedaba
-    ilegible. Sumamos `dim=False` a ese mismo `post_style`, que es el único punto del
-    pipeline donde se puede cancelar un atributo del renderable.
+    El #39 probó `cursor_foreground_priority="renderable"` para que la fila bajo el
+    cursor conservara el color semántico de cada celda (vencido en rojo, repo en su
+    tono) en vez de aplanarse al color del cursor. Se revirtió (2026-08-05, con
+    captura de la terminal real del usuario): en su paleta clara, "iktus-erp" en
+    ansi_blue y "#422" en color 7 quedaban casi ilegibles sobre la barra de selección
+    oliva -el color por repo depende de cómo cada terminal resuelve los 16 ANSI, y no
+    hay forma de garantizar contraste terminal a terminal-. Con "css" el fg de toda la
+    fila pasa a ser el del cursor, que sí tiene contraste garantizado por construcción.
+    No reintroducir "renderable" sin resolver antes ese problema de contraste.
 
     El `lru_cache` no es optimización: DataTable llama a `cache_clear()` sobre este
     método al invalidar sus cachés, así que sin el decorador la llamada revienta.
@@ -876,7 +880,7 @@ class ListaScreen(Screen):
             yield BotonCabecera("", "toggle_repo", id="cab-toggle", classes="cab-btn")
             yield BotonCabecera("+ new", "nueva", id="cab-nueva", classes="cab-btn")
             yield BotonCabecera("⟳", "refrescar", id="cab-refrescar", classes="cab-btn")
-        tabla = TablaTareas(id="tabla", cursor_foreground_priority="renderable")
+        tabla = TablaTareas(id="tabla")
         tabla.cursor_type = "row"
         tabla.show_header = False
         yield tabla
