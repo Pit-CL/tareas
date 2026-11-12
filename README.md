@@ -397,9 +397,9 @@ On success it prints the issue reference and exits `0`:
 created iktus-erp#431 · due 2026-08-20 · https://github.com/owner/iktus-erp/issues/431
 ```
 
-On failure it prints a message to stderr and exits `2` — never anything else, so
-the crash-restart loop the TUI relies on (see below) can't turn one failed
-`tareas add` into a duplicate issue by retrying it.
+On a handled failure it prints a message to stderr and exits `2`. The launcher never
+restarts `add` (see below), so one failed `tareas add` can't turn into a duplicate
+issue by retrying it.
 
 ## Colors
 
@@ -441,6 +441,9 @@ short pause), which makes it a good fit for a pane that's meant to stay alive �
 tmux, another terminal multiplexer, or any pane manager that keeps a long-running
 command around. Point that pane's command at `bin/tareas` (or the `tareas` symlink
 on your `PATH`) and it keeps coming back on its own.
+
+`tareas add` is the exception: it runs once and returns its exit code, so a script or
+agent calling it never waits on a restart.
 
 ## Development
 
