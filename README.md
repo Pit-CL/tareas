@@ -442,6 +442,9 @@ tmux, another terminal multiplexer, or any pane manager that keeps a long-runnin
 command around. Point that pane's command at `bin/tareas` (or the `tareas` symlink
 on your `PATH`) and it keeps coming back on its own.
 
+`tareas add` is the exception: it runs once and returns its exit code, so a script or
+agent calling it never waits on a restart.
+
 ## Development
 
 ```bash
