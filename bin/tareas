@@ -95,8 +95,7 @@ export PYTHONPATH="$RAIZ/src${PYTHONPATH:+:$PYTHONPATH}"
 # código de salida. Reiniciarla tras un fallo la deja colgada hasta el timeout del
 # llamador y, si ya escribió en GitHub, duplicaría el issue.
 if [ "${1:-}" = "add" ]; then
-  "$VENV/bin/python" -m tareas_tui "$@"
-  exit $?
+  exec "$VENV/bin/python" -m tareas_tui "$@"
 fi
 
 while true; do

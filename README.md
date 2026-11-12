@@ -397,9 +397,9 @@ On success it prints the issue reference and exits `0`:
 created iktus-erp#431 · due 2026-08-20 · https://github.com/owner/iktus-erp/issues/431
 ```
 
-On failure it prints a message to stderr and exits `2` — never anything else, so
-the crash-restart loop the TUI relies on (see below) can't turn one failed
-`tareas add` into a duplicate issue by retrying it.
+On a handled failure it prints a message to stderr and exits `2`. The launcher never
+restarts `add` (see below), so one failed `tareas add` can't turn into a duplicate
+issue by retrying it.
 
 ## Colors
 
